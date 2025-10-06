@@ -1,9 +1,3 @@
-"""
-Question Encoder Module
-Encodes natural language questions and generates programs
-Save as: src/models/reasoning/question_encoder.py
-"""
-
 import torch
 import torch.nn as nn
 from typing import Dict, List, Tuple, Optional

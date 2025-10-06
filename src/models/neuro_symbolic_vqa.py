@@ -378,6 +378,7 @@ if __name__ == "__main__":
     # Test forward pass
     print("\nTesting forward pass...")
     batch_size = 2
+    max_program_len = 27
     dummy_images = torch.randn(batch_size, 3, 320, 240)
     dummy_questions = torch.randint(0, len(question_vocab), (batch_size, 10))
     dummy_lengths = torch.tensor([8, 10])
@@ -401,9 +402,27 @@ if __name__ == "__main__":
     print("\nTesting loss computation...")
     loss_fn = VQALoss()
     
+    # Prepare targets
+    # 1. Program targets (padded to max_program_len)
+    program_targets = torch.zeros(batch_size, max_program_len, dtype=torch.long)
+    program_targets[:, :10] = torch.randint(1, len(program_vocab), (batch_size, 10))
+    
+    # 2. Answer targets
+    answer_targets = torch.randint(0, len(answer_vocab), (batch_size,))
+    
+    # 3. Dummy attribute targets (for attribute loss)
+    color_targets = torch.randint(0, 8, (batch_size, model.max_objects))
+    shape_targets = torch.randint(0, 3, (batch_size, model.max_objects))
+    material_targets = torch.randint(0, 2, (batch_size, model.max_objects))
+    size_targets = torch.randint(0, 2, (batch_size, model.max_objects))
+    
     targets = {
-        'answer_targets': torch.randint(0, len(answer_vocab), (batch_size,)),
-        'program_targets': torch.randint(0, len(program_vocab), (batch_size, 10))
+        'program_targets': program_targets,
+        'answer_targets': answer_targets,
+        'color_targets': color_targets,
+        'shape_targets': shape_targets,
+        'material_targets': material_targets,
+        'size_targets': size_targets
     }
     
     losses = loss_fn(outputs, targets)
