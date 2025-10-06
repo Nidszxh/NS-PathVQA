@@ -1,8 +1,3 @@
-"""
-Evaluation Script for Neuro-Symbolic VQA
-Save as: evaluate.py
-"""
-
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -15,7 +10,7 @@ import sys
 # Add src to path
 sys.path.append('src')
 
-from data_loaders.clevr_dataset import CLEVRDataset, get_clevr_dataloader
+from data_loaders.clevrDataset import CLEVRDataset, clevrDataloader
 from models.neuro_symbolic_vqa import NeuroSymbolicVQA
 from models.reasoning.question_encoder import QuestionVocabulary, ProgramVocabulary
 from utils.config import Config
@@ -86,7 +81,7 @@ class Evaluator:
         print(f"\nEvaluating on {split} split...")
         
         # Load dataset
-        dataloader = get_clevr_dataloader(
+        dataloader = clevrDataloader(
             data_dir=str(self.config.data.data_dir),
             split=split,
             batch_size=self.config.data.batch_size,

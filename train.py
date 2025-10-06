@@ -85,7 +85,7 @@ class Trainer:
         """Build vocabularies from training data"""
         # Load training questions to build vocab
         train_dataset = CLEVRDataset(
-            data_dir=str(self.config.data.data_dir),
+            str(self.config.data.data_dir),  # positional argument
             split='train',
             max_samples=self.config.data.max_train_samples
         )
@@ -423,6 +423,10 @@ def main():
         config = get_debug_config()
     else:
         config = get_default_config()
+
+    # Ensure reasoning.modules is initialized
+    if config.reasoning.modules is None:
+        config.reasoning.modules = []
     
     # Print configuration
     config.print_config()

@@ -1,4 +1,9 @@
-from dataclasses import dataclass
+"""
+Configuration file for CLEVR Neuro-Symbolic VQA
+Save as: src/utils/config.py
+"""
+
+from dataclasses import dataclass, field
 from typing import Tuple, List
 from pathlib import Path
 
@@ -6,7 +11,7 @@ from pathlib import Path
 @dataclass
 class DataConfig:
     """Dataset configuration"""
-    data_dir: str = "data/CLEVR_v1.0"
+    data_dir: str = "data/processed"
     image_size: Tuple[int, int] = (320, 240)
     batch_size: int = 64
     num_workers: int = 4
@@ -69,48 +74,43 @@ class ReasoningConfig:
     """Symbolic reasoning module configuration"""
     # Module types
     module_dim: int = 512
-    
-    # Available modules
-    modules: List[str] = None
-    
-    def __post_init__(self):
-        if self.modules is None:
-            self.modules = [
-                # Filtering
-                'filter_color', 'filter_shape', 'filter_material', 'filter_size',
-                # Query
-                'query_color', 'query_shape', 'query_material', 'query_size',
-                # Comparison
-                'same_color', 'same_shape', 'same_material', 'same_size',
-                'equal_integer', 'less_than', 'greater_than',
-                # Counting
-                'count', 'exist', 'unique',
-                # Spatial
-                'relate', 'intersect', 'union',
-            ]
-    
-    # Execution
     max_execution_steps: int = 50
     
-    # Attributes
-    colors: List[str] = None
-    shapes: List[str] = None
-    materials: List[str] = None
-    sizes: List[str] = None
-    relations: List[str] = None
+    # Available modules - use field with default_factory
+    modules: List[str] = field(default_factory=lambda: [
+        # Filtering
+        'filter_color', 'filter_shape', 'filter_material', 'filter_size',
+        # Query
+        'query_color', 'query_shape', 'query_material', 'query_size',
+        # Comparison
+        'same_color', 'same_shape', 'same_material', 'same_size',
+        'equal_integer', 'less_than', 'greater_than',
+        # Counting
+        'count', 'exist', 'unique',
+        # Spatial
+        'relate', 'intersect', 'union',
+    ])
     
-    def __post_init__(self):
-        if self.colors is None:
-            self.colors = ['gray', 'red', 'blue', 'green', 'brown', 
-                          'purple', 'cyan', 'yellow']
-        if self.shapes is None:
-            self.shapes = ['cube', 'sphere', 'cylinder']
-        if self.materials is None:
-            self.materials = ['rubber', 'metal']
-        if self.sizes is None:
-            self.sizes = ['small', 'large']
-        if self.relations is None:
-            self.relations = ['left', 'right', 'behind', 'front']
+    # Attributes - use field with default_factory
+    colors: List[str] = field(default_factory=lambda: [
+        'gray', 'red', 'blue', 'green', 'brown', 'purple', 'cyan', 'yellow'
+    ])
+    
+    shapes: List[str] = field(default_factory=lambda: [
+        'cube', 'sphere', 'cylinder'
+    ])
+    
+    materials: List[str] = field(default_factory=lambda: [
+        'rubber', 'metal'
+    ])
+    
+    sizes: List[str] = field(default_factory=lambda: [
+        'small', 'large'
+    ])
+    
+    relations: List[str] = field(default_factory=lambda: [
+        'left', 'right', 'behind', 'front'
+    ])
 
 
 @dataclass
@@ -160,17 +160,17 @@ class TrainingConfig:
 class PathConfig:
     """Path configuration"""
     # Base paths
-    root_dir: Path = Path(".")
-    data_dir: Path = Path("data/CLEVR_v1.0")
+    root_dir: Path = field(default_factory=lambda: Path("."))
+    data_dir: Path = field(default_factory=lambda: Path("data/processed"))
     
     # Output paths
-    checkpoint_dir: Path = Path("checkpoints")
-    log_dir: Path = Path("logs")
-    output_dir: Path = Path("outputs")
+    checkpoint_dir: Path = field(default_factory=lambda: Path("checkpoints"))
+    log_dir: Path = field(default_factory=lambda: Path("logs"))
+    output_dir: Path = field(default_factory=lambda: Path("outputs"))
     
     # Specific paths
-    best_model_path: Path = Path("checkpoints/best_model.pt")
-    vocab_path: Path = Path("data/vocab.json")
+    best_model_path: Path = field(default_factory=lambda: Path("checkpoints/best_model.pt"))
+    vocab_path: Path = field(default_factory=lambda: Path("data/vocab.json"))
     
     def __post_init__(self):
         # Create directories
@@ -181,33 +181,18 @@ class PathConfig:
 @dataclass
 class Config:
     """Main configuration class"""
-    # Sub-configurations
-    data: DataConfig = None
-    visual: VisualConfig = None
-    question: QuestionConfig = None
-    reasoning: ReasoningConfig = None
-    training: TrainingConfig = None
-    paths: PathConfig = None
-    
     # Experiment
     experiment_name: str = "clevr_baseline"
     seed: int = 42
     debug: bool = False
     
-    def __post_init__(self):
-        # Initialize sub-configs if not provided
-        if self.data is None:
-            self.data = DataConfig()
-        if self.visual is None:
-            self.visual = VisualConfig()
-        if self.question is None:
-            self.question = QuestionConfig()
-        if self.reasoning is None:
-            self.reasoning = ReasoningConfig()
-        if self.training is None:
-            self.training = TrainingConfig()
-        if self.paths is None:
-            self.paths = PathConfig()
+    # Sub-configurations - use field with default_factory
+    data: DataConfig = field(default_factory=DataConfig)
+    visual: VisualConfig = field(default_factory=VisualConfig)
+    question: QuestionConfig = field(default_factory=QuestionConfig)
+    reasoning: ReasoningConfig = field(default_factory=ReasoningConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    paths: PathConfig = field(default_factory=PathConfig)
     
     def save(self, path: str):
         """Save configuration to JSON file"""
@@ -242,16 +227,22 @@ class Config:
             config_dict = json.load(f)
         
         # Reconstruct Config object
-        # This is a simplified version; for production, use a proper deserialization
         config = cls()
         
         # Update values from dict
         for key, value in config_dict.items():
-            if hasattr(config, key) and isinstance(value, dict):
-                sub_config = getattr(config, key)
-                for sub_key, sub_value in value.items():
-                    if hasattr(sub_config, sub_key):
-                        setattr(sub_config, sub_key, sub_value)
+            if key in ['data', 'visual', 'question', 'reasoning', 'training', 'paths']:
+                if isinstance(value, dict):
+                    sub_config = getattr(config, key)
+                    for sub_key, sub_value in value.items():
+                        if hasattr(sub_config, sub_key):
+                            # Convert string paths back to Path objects
+                            if 'path' in sub_key.lower() or 'dir' in sub_key.lower():
+                                sub_value = Path(sub_value)
+                            setattr(sub_config, sub_key, sub_value)
+            else:
+                if hasattr(config, key):
+                    setattr(config, key, value)
         
         print(f"✓ Configuration loaded from {path}")
         return config
@@ -296,6 +287,9 @@ class Config:
         print(f"  Module dim: {self.reasoning.module_dim}")
         print(f"  Number of modules: {len(self.reasoning.modules)}")
         print(f"  Max execution steps: {self.reasoning.max_execution_steps}")
+        print(f"  Colors: {len(self.reasoning.colors)}")
+        print(f"  Shapes: {len(self.reasoning.shapes)}")
+        print(f"  Materials: {len(self.reasoning.materials)}")
         
         print("\n" + "-" * 80)
         print("TRAINING CONFIG")
@@ -345,6 +339,9 @@ if __name__ == "__main__":
     config = get_default_config()
     config.print_config()
     
+    # Create output directory if it doesn't exist
+    Path("outputs").mkdir(exist_ok=True)
+    
     # Save config
     config.save("outputs/config_default.json")
     
@@ -353,5 +350,11 @@ if __name__ == "__main__":
     debug_config = get_debug_config()
     debug_config.print_config()
     debug_config.save("outputs/config_debug.json")
+    
+    # Test loading
+    print("\n\n")
+    print("Testing config loading...")
+    loaded_config = Config.load("outputs/config_default.json")
+    print("✓ Config loaded successfully")
     
     print("\n✓ Configuration test complete!")
