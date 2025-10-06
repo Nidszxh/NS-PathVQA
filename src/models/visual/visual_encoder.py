@@ -1,9 +1,3 @@
-"""
-Visual Encoder Module
-Extracts visual features and detects objects in images
-Save as: src/models/visual/visual_encoder.py
-"""
-
 import torch
 import torch.nn as nn
 import torchvision
@@ -345,8 +339,9 @@ class SimpleObjectDetector(nn.Module):
             
             # Add spatial encoding to features
             spatial_features = self.spatial_encoder(boxes)
-            obj_features = obj_features + spatial_features
-            
+            combined_features = torch.cat([obj_features, spatial_features], dim=-1)
+            obj_features = nn.Linear(combined_features.size(-1), obj_features.size(-1)).to(device)(combined_features)
+
             # Pad to max_objects
             padded_features = torch.zeros(
                 self.max_objects, self.num_object_features, device=device
