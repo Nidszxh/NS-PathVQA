@@ -98,6 +98,7 @@ celerybeat.pid
 .env
 .envrc
 .venv
+.ichigo/
 env/
 venv/
 ENV/
@@ -139,5 +140,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+checkpoints/
 data/
 logs/
+outputs/
