@@ -78,22 +78,23 @@ class SimpleObjectDetector(nn.Module):
         all_features = torch.zeros(batch_size, self.max_objects, self.num_object_features, device=device)
         all_masks = torch.zeros(batch_size, self.max_objects, dtype=torch.bool, device=device)
 
-        # Per-sample: gather features at top-k locations, apply spatial encoding
-        for i in range(batch_size):
-            y = top_k_y[i]
-            x = top_k_x[i]
-            obj_feats = feature_maps[i, :, y, x].T
-            obj_feats = self.feature_projection(obj_feats)
-            boxes = torch.zeros(k, 4, device=device)
-            boxes[:, 0] = x.float() / w
-            boxes[:, 1] = y.float() / h
-            boxes[:, 2] = 1.0 / w
-            boxes[:, 3] = 1.0 / h
-            spatial = self.spatial_encoder(boxes)
-            combined = torch.cat([obj_feats, spatial], dim=-1)
-            obj_feats = self.spatial_projector(combined)
-            all_features[i, :k] = obj_feats
-            all_masks[i, :k] = True
+        # Vectorized gather: extract features at top-k locations for all samples at once
+        b_idx = torch.arange(batch_size, device=device)[:, None, None]
+        c_idx = torch.arange(self.feature_dim, device=device)[None, :, None]
+        obj_feats = feature_maps[b_idx, c_idx, top_k_y[:, None, :], top_k_x[:, None, :]]
+        obj_feats = obj_feats.permute(0, 2, 1).contiguous()
+        obj_feats = self.feature_projection(obj_feats)
+
+        boxes = torch.stack([
+            top_k_x.float() / w, top_k_y.float() / h,
+            torch.ones_like(top_k_x, dtype=torch.float) / w,
+            torch.ones_like(top_k_y, dtype=torch.float) / h,
+        ], dim=-1)
+        spatial = self.spatial_encoder(boxes)
+        combined = torch.cat([obj_feats, spatial], dim=-1)
+        obj_feats = self.spatial_projector(combined)
+        all_features[:, :k] = obj_feats
+        all_masks[:, :k] = True
 
         return {"features": all_features, "mask": all_masks}
 

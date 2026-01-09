@@ -19,6 +19,12 @@ on known anatomical terms (e.g. "gastrointestinal system", "lung").
 
 import torch
 from typing import Dict, List, Tuple
+from pathlib import Path
+import sys
+
+_src = str(Path(__file__).resolve().parent.parent)
+if _src not in sys.path:
+    sys.path.append(_src)
 
 from symbolic.query_parser import Query
 from symbolic.scene_parser import COLOR_VALUES, SHAPE_VALUES, SIZE_VALUES
@@ -34,7 +40,9 @@ REGION_ANSWER_PREFIXES = [
 SIMPLE_REGIONS = [
     "oral", "lung", "liver", "spleen", "heart", "brain", "skin",
     "extremities", "joints", "kidney", "abdomen", "pancreas",
-    "breast",
+    "breast", "stomach", "colon", "esophagus", "appendix",
+    "intestine", "face", "eyes", "uterus", "ovary", "nose",
+    "skull", "petrous",
 ]
 NUM_COLORS = len(COLOR_VALUES)
 NUM_SHAPES = len(SHAPE_VALUES)
@@ -47,7 +55,13 @@ def _is_region_answer(answer: str) -> bool:
     for prefix in REGION_ANSWER_PREFIXES:
         if a.startswith(prefix):
             return True
-    return a in SIMPLE_REGIONS
+    if a in SIMPLE_REGIONS:
+        return True
+    # Catch answers like "bone, calvarium" where a region name is followed by a comma
+    for region in SIMPLE_REGIONS:
+        if a.startswith(region + ","):
+            return True
+    return False
 
 
 def _build_index_mapping(
@@ -138,17 +152,14 @@ def execute(
     if region_logits is None:
         return {"symbolic_logits": symbolic_logits, "region_logits": None, "trace": trace}
 
-    has_valid_mapping = region_to_answer_idx.min() >= 0
-
     for i, query in enumerate(queries):
         if query.qtype in ("identity", "location"):
-            # Boost region answers with their corresponding region logit
-            if has_valid_mapping:
-                for j in range(len(region_names)):
-                    aidx = region_to_answer_idx[j]
-                    if aidx >= 0:
-                        symbolic_logits[i, aidx] = symbolic_logits[i, aidx] + region_logits[i, j]
-                trace["symbolic_used"][i] = True
+            # Boost each region's answer entry with its corresponding logit
+            for j in range(len(region_names)):
+                aidx = region_to_answer_idx[j]
+                if aidx >= 0:
+                    symbolic_logits[i, aidx] = symbolic_logits[i, aidx] + region_logits[i, j]
+            trace["symbolic_used"][i] = True
 
         elif query.qtype == "yes_no":
             # For yes/no questions about a region, boost that region's answer
@@ -156,7 +167,7 @@ def execute(
                 aidx = answer_to_idx[query.target]
                 symbolic_logits[i, aidx] = region_logits[i, :].max()
                 trace["symbolic_used"][i] = True
-            elif has_valid_mapping:
+            else:
                 for j, name in enumerate(region_names):
                     if name in answer_to_idx:
                         aidx = answer_to_idx[name]
@@ -168,22 +179,50 @@ def execute(
             attr_logits = scene_logits.get(attr_logits_key)
             if attr_logits is not None and query.attribute in attribute_mappings:
                 mapping = attribute_mappings[query.attribute].to(device)
-                if mapping.min() >= 0:
-                    for j in range(len(mapping)):
-                        aidx = mapping[j]
-                        if aidx >= 0:
-                            symbolic_logits[i, aidx] = attr_logits[i, j]
-                    trace["symbolic_used"][i] = True
+                for j in range(len(mapping)):
+                    aidx = mapping[j]
+                    if aidx >= 0:
+                        symbolic_logits[i, aidx] = attr_logits[i, j]
+                trace["symbolic_used"][i] = True
 
         elif query.qtype == "count":
-            # Use object presence sum as a crude count signal
-            obj_presence = scene_logits.get("scene_object_presence")
-            if obj_presence is not None:
-                count_est = obj_presence[i].sum()
-                symbolic_logits[i, :] = count_est / max(obj_presence.size(-1), 1)
+            # Count questions: no meaningful symbolic signal from current setup,
+            # skip to avoid adding uniform noise
+            pass
 
     return {
         "symbolic_logits": symbolic_logits,
         "region_logits": region_logits,
         "trace": trace,
     }
+
+
+if __name__ == "__main__":
+    print("Testing Executor...")
+    region_names = ["bone", "gastrointestinal", "lung"]
+    answer_vocab = ["yes", "no", "bone", "bone, calvarium", "gastrointestinal",
+                     "gastrointestinal system", "red", "blue", "large", "small"]
+    answer_to_idx = {a: i for i, a in enumerate(answer_vocab)}
+    region_to_answer_idx = build_region_mapping(region_names, answer_to_idx)
+    attr_mappings = build_attribute_mappings(answer_to_idx)
+
+    batch_size = 2
+    scene_logits = {
+        "scene_region_logits": torch.randn(batch_size, len(region_names)),
+        "scene_object_presence": torch.sigmoid(torch.randn(batch_size, len(region_names))),
+        "scene_color_logits": torch.randn(batch_size, len(COLOR_VALUES)),
+        "scene_shape_logits": torch.randn(batch_size, len(SHAPE_VALUES)),
+        "scene_size_logits": torch.randn(batch_size, len(SIZE_VALUES)),
+    }
+    queries = [
+        Query(qtype="identity", target="bone"),
+        Query(qtype="location", target="gastrointestinal"),
+    ]
+    neural_logits = torch.randn(batch_size, len(answer_vocab))
+
+    result = execute(scene_logits, queries, region_names, region_to_answer_idx,
+                     attr_mappings, answer_to_idx, len(answer_vocab), neural_logits)
+    print(f"Symbolic logits shape: {result['symbolic_logits'].shape}")
+    print(f"Region logits shape: {result['region_logits'].shape}")
+    print(f"Symbolic used: {result['trace']['symbolic_used']}")
+    print("Executor test passed!")

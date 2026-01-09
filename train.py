@@ -59,7 +59,7 @@ class Trainer:
         if config.symbolic.enabled:
             self.region_names = build_region_names(self.answer_vocab)
             print(f"Built {len(self.region_names)} region names from answer vocabulary")
-            self.region_to_answer_idx = build_region_mapping(self.region_names, self.answer_to_idx)
+            self.region_to_answer_idx = build_region_mapping(self.region_names, self.answer_to_idx).to(self.device)
             self.attribute_mappings = build_attribute_mappings(self.answer_to_idx)
             attr_sizes = {k: len(v) for k, v in self.attribute_mappings.items()}
             print(f"Attribute mappings: {attr_sizes}")
@@ -71,14 +71,14 @@ class Trainer:
             self.region_to_answer_idx = torch.tensor([], dtype=torch.long)
             self.attribute_mappings = {}
 
-        # Build or load question vocabulary
+        # Build or load question vocabulary (iterate strings only, no image transforms)
         self.question_vocab = QuestionVocabulary()
         q_path = config.paths.data_dir / "question_vocab.json"
         if q_path.exists():
             self.question_vocab = QuestionVocabulary.load(str(q_path))
         else:
-            for item in train_dataset:
-                self.question_vocab.build_from_questions([item["question"]])
+            for question in train_dataset.data["question"]:
+                self.question_vocab.build_from_questions([question])
             config.paths.data_dir.mkdir(parents=True, exist_ok=True)
             self.question_vocab.save(str(q_path))
 
@@ -97,10 +97,12 @@ class Trainer:
 
         # Build dataloaders
         print("Building dataloaders...")
+        nw = config.data.num_workers
         self.train_loader = DataLoader(
             train_dataset, batch_size=config.data.batch_size,
-            shuffle=True, num_workers=config.data.num_workers,
+            shuffle=True, num_workers=nw,
             collate_fn=collate_fn, pin_memory=True,
+            persistent_workers=(nw > 0), prefetch_factor=2 if nw > 0 else None,
         )
         self.val_loader = pathvqa_dataloader(
             split="val", batch_size=config.data.batch_size,
@@ -118,10 +120,14 @@ class Trainer:
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
+        self.amp_enabled = config.training.use_amp and self.device.type == "cuda"
+        self.scaler = torch.amp.GradScaler(self.device.type, enabled=self.amp_enabled)
+        self.early_stop_counter = 0
+        self.best_val_acc = 0.0
+        self.checkpoint_paths = []  # track paths for rolling checkpoint deletion
         self.writer = SummaryWriter(log_dir=config.paths.log_dir / config.experiment_name)
         self.current_epoch = 0
         self.global_step = 0
-        self.best_val_acc = 0.0
 
     def _build_optimizer(self):
         t = self.config.training
@@ -153,7 +159,7 @@ class Trainer:
             scene_logits=outputs,
             queries=queries,
             region_names=self.region_names,
-            region_to_answer_idx=self.region_to_answer_idx.to(self.device),
+            region_to_answer_idx=self.region_to_answer_idx,
             attribute_mappings=self.attribute_mappings,
             answer_to_idx=self.answer_to_idx,
             answer_vocab_size=len(self.answer_vocab),
@@ -170,14 +176,17 @@ class Trainer:
         for batch_idx, batch in enumerate(pbar):
             q_idx, q_len, targets, images = prepare_batch(batch, self.question_vocab, self.device)
             questions = batch["questions"]
-            outputs = self.model(images, q_idx, q_len)
-            logits, _ = self._compute_symbolic_logits(outputs, questions)
-            loss = self.criterion(logits, targets)
+            with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
+                outputs = self.model(images, q_idx, q_len)
+                logits, _ = self._compute_symbolic_logits(outputs, questions)
+                loss = self.criterion(logits, targets)
             self.optimizer.zero_grad()
-            loss.backward()
+            self.scaler.scale(loss).backward()
             if self.config.training.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.training.grad_clip)
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
             preds = logits.argmax(dim=1)
             correct += (preds == targets).sum().item()
             total += targets.size(0)
@@ -200,8 +209,9 @@ class Trainer:
             for batch in tqdm(self.val_loader, desc="Validating"):
                 q_idx, q_len, targets, images = prepare_batch(batch, self.question_vocab, self.device)
                 questions = batch["questions"]
-                outputs = self.model(images, q_idx, q_len)
-                logits, trace = self._compute_symbolic_logits(outputs, questions)
+                with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
+                    outputs = self.model(images, q_idx, q_len)
+                    logits, trace = self._compute_symbolic_logits(outputs, questions)
                 loss = self.criterion(logits, targets)
                 preds = logits.argmax(dim=1)
                 correct += (preds == targets).sum().item()
@@ -234,16 +244,23 @@ class Trainer:
         path = self.config.paths.checkpoint_dir / f"checkpoint_epoch_{self.current_epoch}.pt"
         torch.save(ckpt, path)
         print(f"Saved: {path}")
+        self.checkpoint_paths.append(path)
+        max_ckpt = self.config.training.max_checkpoints
+        while len(self.checkpoint_paths) > max_ckpt:
+            old = self.checkpoint_paths.pop(0)
+            if old.exists():
+                old.unlink()
         if is_best:
             best_path = self.config.paths.checkpoint_dir / "best_model.pt"
             torch.save(ckpt, best_path)
             print(f"Saved best: {best_path}")
 
     def train(self):
-        """Main training loop: iterate epochs, validate, checkpoint."""
+        """Main training loop: iterate epochs, validate, checkpoint, early stop."""
         print("\n" + "=" * 60)
         print("STARTING TRAINING")
         print("=" * 60)
+        patience = self.config.training.early_stop_patience
         for epoch in range(self.config.training.num_epochs):
             self.current_epoch = epoch
             tl, ta = self.train_epoch()
@@ -260,16 +277,27 @@ class Trainer:
                 is_best = va > self.best_val_acc
                 if is_best:
                     self.best_val_acc = va
+                    self.early_stop_counter = 0
                     print(f"  New best val acc: {va:.2f}%")
+                else:
+                    self.early_stop_counter += 1
+                    print(f"  No improvement ({self.early_stop_counter}/{patience})")
                 if epoch % self.config.training.save_every == 0 or is_best:
                     self.save_checkpoint(is_best=is_best)
+                if self.early_stop_counter >= patience:
+                    print(f"\nEarly stopping triggered after {epoch + 1} epochs "
+                          f"(no improvement for {patience} validation runs)")
+                    break
 
             if not isinstance(self.scheduler, optim.lr_scheduler.ReduceLROnPlateau):
                 self.scheduler.step()
+
+        self.save_checkpoint(is_best=False)
         print(f"\nBest val acc: {self.best_val_acc:.2f}%")
 
 
 def main():
+    """Parse CLI args, build config, and launch training."""
     import argparse
     parser = argparse.ArgumentParser(description="Train Neuro-Symbolic PathVQA")
     parser.add_argument("--config", type=str, help="Path to config JSON")
@@ -287,6 +315,8 @@ def main():
     torch.manual_seed(config.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(config.seed)
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision('high')
     Trainer(config).train()
 
 

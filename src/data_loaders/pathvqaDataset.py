@@ -1,10 +1,14 @@
 """PathVQA dataset loader from HuggingFace with image transforms."""
 
+import warnings
 from typing import Dict, List, Optional
 import torch
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as transforms
 from datasets import load_dataset
+
+# Suppress harmless "Truncated File Read" warnings from truncated TIFFs in PathVQA
+warnings.filterwarnings("ignore", message="Truncated File Read")
 
 
 class PathVQADataset(Dataset):
@@ -37,10 +41,12 @@ class PathVQADataset(Dataset):
 
         print(f"Loaded {len(self.data)} samples, answer vocab: {len(self.answers)}")
 
-    def __len__(self):
+    def __len__(self) -> int:
+        """Number of samples in the dataset."""
         return len(self.data)
 
     def __getitem__(self, idx: int) -> Dict:
+        """Load and transform one (image, question, answer) sample."""
         item = self.data[idx]
         image = self.transform(item["image"].convert("RGB"))
         return {
@@ -88,4 +94,17 @@ def pathvqa_dataloader(split: str = "train", batch_size: int = 32,
     """Convenience function to create a configured PathVQA DataLoader."""
     dataset = PathVQADataset(split, image_size, max_samples)
     return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
-                      num_workers=num_workers, collate_fn=collate_fn, pin_memory=True)
+                      num_workers=num_workers, collate_fn=collate_fn,
+                      pin_memory=True, persistent_workers=(num_workers > 0),
+                      prefetch_factor=2 if num_workers > 0 else None)
+
+
+if __name__ == "__main__":
+    print("Testing PathVQADataset...")
+    ds = PathVQADataset(split="train", image_size=(320, 240), max_samples=10)
+    item = ds[0]
+    print(f"Image shape: {item['image'].shape}, Question: {item['question'][:50]}..., Answer: {item['answer']}")
+    print(f"Answer vocab size: {len(ds.answers)}")
+    batch = collate_fn([ds[i] for i in range(4)])
+    print(f"Batch images shape: {batch['images'].shape}")
+    print("Dataset test passed!")

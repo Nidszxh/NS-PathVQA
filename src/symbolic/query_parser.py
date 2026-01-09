@@ -51,15 +51,6 @@ LOCATION_PATTERNS = [
     r"what (?:organ|system|region|part|area|structure)",
 ]
 
-YES_NO_PATTERNS = [
-    r"^(?:is|are|does|do|can|has|have|was|were) ",
-    r"\?$",
-]
-
-COUNT_PATTERNS = [
-    r"how many",
-]
-
 ATTRIBUTE_PATTERNS = {
     "color": r"what colo[u]?r",
     "size": r"what (?:size|is the size)",
@@ -124,3 +115,19 @@ def parse_question(question: str, answer_vocab: Optional[List[str]] = None) -> Q
 
     # Default fallback: treat as identity question
     return Query(qtype="identity", target=target)
+
+
+if __name__ == "__main__":
+    test_questions = [
+        "what color is the lesion?",
+        "how many nuclei are present?",
+        "is this a malignant tumor?",
+        "what is shown in this image?",
+        "where is the abnormality located?",
+        "what shape are the cells?",
+    ]
+    dummy_vocab = ["lesion", "malignant", "tumor", "nuclei", "cells"]
+    for q in test_questions:
+        result = parse_question(q, dummy_vocab)
+        print(f"  {q:45s} → qtype={result.qtype:10s} target={result.target:15s} attr={result.attribute}")
+    print("QueryParser test passed!")

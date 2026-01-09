@@ -10,6 +10,7 @@ The actual dataloader, model, training, and evaluation logic lives in:
 
 
 def main():
+    """Print usage info and exit (entry point redirects to train.py)."""
     print("=" * 60)
     print("PathVQA Dataset — HuggingFace")
     print("=" * 60)

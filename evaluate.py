@@ -33,6 +33,7 @@ class Evaluator:
     """Loads a trained checkpoint and evaluates on PathVQA data."""
 
     def __init__(self, checkpoint_path: str, config_path: str = None):
+        """Load checkpoint, rebuild model and vocab, prepare symbolic mappings."""
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Loading checkpoint from {checkpoint_path}...")
         ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
@@ -53,7 +54,7 @@ class Evaluator:
         # Build symbolic mappings if region names are available
         if not self.region_names:
             self.region_names = build_region_names(self.answer_vocab)
-        self.region_to_answer_idx = build_region_mapping(self.region_names, self.answer_to_idx)
+        self.region_to_answer_idx = build_region_mapping(self.region_names, self.answer_to_idx).to(self.device)
         self.attribute_mappings = build_attribute_mappings(self.answer_to_idx)
 
         # Load question vocabulary and build model
@@ -63,6 +64,7 @@ class Evaluator:
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.model.to(self.device)
         self.model.eval()
+        self.amp_enabled = self.config.training.use_amp and self.device.type == "cuda"
         print(f"Model loaded. Best val acc: {ckpt['best_val_acc']:.2f}%")
         print(f"Symbolic: {'enabled' if self.config.symbolic.enabled else 'disabled'}, "
               f"{len(self.region_names)} regions")
@@ -78,7 +80,7 @@ class Evaluator:
             scene_logits=outputs,
             queries=queries,
             region_names=self.region_names,
-            region_to_answer_idx=self.region_to_answer_idx.to(self.device),
+            region_to_answer_idx=self.region_to_answer_idx,
             attribute_mappings=self.attribute_mappings,
             answer_to_idx=self.answer_to_idx,
             answer_vocab_size=len(self.answer_vocab),
@@ -97,8 +99,9 @@ class Evaluator:
             for batch in tqdm(loader, desc="Evaluating"):
                 q_idx, q_len, targets, images = prepare_batch(batch, self.question_vocab, self.device)
                 questions = batch["questions"]
-                outputs = self.model(images, q_idx, q_len)
-                logits, _ = self._compute_symbolic_logits(outputs, questions)
+                with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
+                    outputs = self.model(images, q_idx, q_len)
+                    logits, _ = self._compute_symbolic_logits(outputs, questions)
                 preds = logits.argmax(dim=1)
                 correct += (preds == targets).sum().item()
                 total += targets.size(0)
@@ -107,6 +110,7 @@ class Evaluator:
 
 
 def main():
+    """Parse CLI args, load checkpoint, and run evaluation."""
     import argparse
     parser = argparse.ArgumentParser(description="Evaluate Neuro-Symbolic PathVQA")
     parser.add_argument("--checkpoint", type=str, required=True)

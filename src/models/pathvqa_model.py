@@ -55,7 +55,7 @@ class CrossModalAttention(nn.Module):
         q = question_state.unsqueeze(1).expand(-1, visual_features.size(1), -1)
         combined = torch.cat([visual_features, q], dim=-1)
         scores = self.attend(combined).squeeze(-1)
-        scores = scores.masked_fill(~mask, -1e9)
+        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
         weights = torch.softmax(scores, dim=1)
         attended = (weights.unsqueeze(-1) * visual_features).sum(dim=1)
         return attended

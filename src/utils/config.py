@@ -9,8 +9,8 @@ from pathlib import Path
 class DataConfig:
     """Data loading parameters."""
     image_size: Tuple[int, int] = (320, 240)
-    batch_size: int = 64
-    num_workers: int = 4
+    batch_size: int = 32
+    num_workers: int = 6
     max_train_samples: Optional[int] = None
     max_val_samples: Optional[int] = None
 
@@ -49,7 +49,10 @@ class TrainingConfig:
     save_every: int = 5
     log_every: int = 100
     validate_every: int = 1
+    early_stop_patience: int = 10
+    max_checkpoints: int = 3
     device: str = "cuda"
+    use_amp: bool = True
 
 
 @dataclass
