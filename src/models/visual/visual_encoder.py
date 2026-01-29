@@ -1,110 +1,139 @@
-"""Visual perception module: ResNet backbone + object proposal + spatial encoding."""
+"""Visual encoder: frozen CLIP/PLIP ViT-B/32 + LoRA → patch tokens → projection."""
 
-from typing import Dict
+from typing import Dict, Tuple
 import torch
 import torch.nn as nn
-import torchvision
+import torch.nn.functional as F
+from peft import LoraConfig, inject_adapter_in_model
+from transformers import CLIPVisionModel
 
 
-class SimpleObjectDetector(nn.Module):
-    """Extracts top-k object features from images using a CNN backbone.
+class CLIPViTEncoder(nn.Module):
+    """Frozen CLIP/PLIP ViT-B/32 + LoRA encoder. Only LoRA adapters and projection are trainable."""
 
-    Uses a pretrained ResNet as backbone, then predicts an objectness score
-    per spatial location to select the top-k most salient regions. Each region
-    is encoded with visual features + spatial coordinates (cx, cy, w, h).
-    """
-
-    def __init__(self, backbone: str = "resnet50", pretrained: bool = True,
-                 num_object_features: int = 512, max_objects: int = 10,
-                 spatial_feat_dim: int = 128):
+    def __init__(
+        self,
+        model_name: str = "openai/clip-vit-base-patch32",
+        num_object_features: int = 512,
+        num_objects: int = 49,
+        lora_rank: int = 16,
+        lora_alpha: int = 32,
+        lora_target_modules: Tuple[str, ...] = (
+            "q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"
+        ),
+    ):
         super().__init__()
         self.num_object_features = num_object_features
-        self.max_objects = max_objects
+        self.num_objects = num_objects
+        self.model_name = model_name
 
-        # Load ResNet backbone, removing the final pooling + FC layers
-        if backbone == "resnet50":
-            resnet = torchvision.models.resnet50(weights="IMAGENET1K_V1" if pretrained else None)
-        elif backbone == "resnet101":
-            resnet = torchvision.models.resnet101(weights="IMAGENET1K_V1" if pretrained else None)
-        else:
-            raise ValueError(f"Unknown backbone: {backbone}")
-        self.feature_dim = 2048
-        self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+        # Frozen vision tower: images → (B, 1+num_patches, hidden_size)
+        self.backbone = CLIPVisionModel.from_pretrained(model_name)
+        for p in self.backbone.parameters():
+            p.requires_grad_(False)
 
-        # Proposal network: predicts which spatial locations are most salient
-        self.proposal_network = nn.Sequential(
-            nn.Conv2d(self.feature_dim, 512, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(512, 256, kernel_size=3, padding=1),
-            nn.ReLU(),
+        # LoRA adapters
+        self.backbone = inject_adapter_in_model(
+            LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                target_modules=list(lora_target_modules),
+                bias="none",
+            ),
+            self.backbone,
         )
-        self.objectness = nn.Conv2d(256, 1, kernel_size=1)
 
-        # Project backbone features per proposal
-        self.feature_projection = nn.Sequential(
-            nn.Linear(self.feature_dim, num_object_features),
-            nn.ReLU(),
-            nn.LayerNorm(num_object_features),
-        )
-        # Encode spatial box coordinates (cx, cy, w, h) for each proposal
-        self.spatial_encoder = nn.Sequential(
-            nn.Linear(4, spatial_feat_dim),
-            nn.ReLU(),
-            nn.Linear(spatial_feat_dim, spatial_feat_dim),
-        )
-        # Fuse visual features with spatial encoding
-        self.spatial_projector = nn.Linear(num_object_features + spatial_feat_dim, num_object_features)
+        # Project hidden_size (768) → num_object_features (512)
+        hidden = self.backbone.config.hidden_size
+        self.projection = nn.Linear(hidden, num_object_features)
 
-    def forward(self, images: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Extract top-k object features and masks.
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable HF gradient checkpointing on the vision tower."""
+        if hasattr(self.backbone, "gradient_checkpointing_enable"):
+            self.backbone.gradient_checkpointing_enable()
 
-        Returns:
-            features: (batch, max_objects, num_object_features) tensor
-            mask: (batch, max_objects) boolean mask of valid objects
-        """
+    def forward(self, images: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
+        """Encode images into patch-token features. Returns 'features' (B, N, D) and 'mask' (B, N)."""
         batch_size = images.size(0)
         device = images.device
-        feature_maps = self.backbone(images)
-        proposals = self.proposal_network(feature_maps)
-        objectness = self.objectness(proposals)
+        out = self.backbone(pixel_values=images)
+        # Drop CLS token → (B, num_patches, hidden) → take first num_objects patches → project to 512-d
+        patches = out.last_hidden_state[:, 1:, :]
+        patches = patches[:, : self.num_objects, :]
+        features = self.projection(patches)
+        mask = torch.ones(batch_size, features.size(1), dtype=torch.bool, device=device)
+        return {"features": features, "mask": mask}
 
-        b, _, h, w = objectness.shape
-        objectness_flat = objectness.view(batch_size, -1)
-        k = min(self.max_objects, h * w)
-        _, top_k_indices = torch.topk(objectness_flat, k, dim=1)
-        top_k_y = top_k_indices // w
-        top_k_x = top_k_indices % w
 
-        all_features = torch.zeros(batch_size, self.max_objects, self.num_object_features, device=device)
-        all_masks = torch.zeros(batch_size, self.max_objects, dtype=torch.bool, device=device)
+class MultiScaleVisualEncoder(CLIPViTEncoder):
+    """Dual-resolution encoder: global 224x224 + high-res quadrant crops, fused via learned gate."""
 
-        # Vectorized gather: extract features at top-k locations for all samples at once
-        b_idx = torch.arange(batch_size, device=device)[:, None, None]
-        c_idx = torch.arange(self.feature_dim, device=device)[None, :, None]
-        obj_feats = feature_maps[b_idx, c_idx, top_k_y[:, None, :], top_k_x[:, None, :]]
-        obj_feats = obj_feats.permute(0, 2, 1).contiguous()
-        obj_feats = self.feature_projection(obj_feats)
+    def __init__(
+        self,
+        model_name: str = "openai/clip-vit-base-patch32",
+        num_object_features: int = 512,
+        num_objects: int = 49,
+        num_crops: int = 4,
+        **kwargs,
+    ):
+        super().__init__(model_name=model_name, num_object_features=num_object_features, num_objects=num_objects, **kwargs)
+        self.num_crops = num_crops
+        # Fusion gate between global and local features
+        self.scale_fusion = nn.Sequential(
+            nn.Linear(num_object_features * 2, num_object_features),
+            nn.LayerNorm(num_object_features),
+            nn.GELU(),
+            nn.Linear(num_object_features, num_object_features),
+        )
 
-        boxes = torch.stack([
-            top_k_x.float() / w, top_k_y.float() / h,
-            torch.ones_like(top_k_x, dtype=torch.float) / w,
-            torch.ones_like(top_k_y, dtype=torch.float) / h,
-        ], dim=-1)
-        spatial = self.spatial_encoder(boxes)
-        combined = torch.cat([obj_feats, spatial], dim=-1)
-        obj_feats = self.spatial_projector(combined)
-        all_features[:, :k] = obj_feats
-        all_masks[:, :k] = True
+    def _extract_crops(self, images: torch.Tensor) -> torch.Tensor:
+        """Extract 4 quadrant crops, each resized to (H, W)."""
+        b, c, h, w = images.shape
+        h_half, w_half = h // 2, w // 2
+        q1 = images[:, :, :h_half, :w_half]
+        q2 = images[:, :, :h_half, w_half:]
+        q3 = images[:, :, h_half:, :w_half]
+        q4 = images[:, :, h_half:, w_half:]
+        crops = [F.interpolate(q, size=(h, w), mode="bilinear", align_corners=False) for q in [q1, q2, q3, q4]]
+        return torch.stack(crops, dim=1)  # (B, 4, C, H, W)
 
-        return {"features": all_features, "mask": all_masks}
+    def forward(self, images: torch.Tensor, use_multiscale: bool = False) -> Dict[str, torch.Tensor]:
+        global_out = super().forward(images)
+        if not use_multiscale:
+            return global_out
+
+        # Multi-scale crop encoding
+        crops = self._extract_crops(images)  # (B, 4, 3, 224, 224)
+        b, n_crops, c, h, w = crops.shape
+        crops_flat = crops.view(b * n_crops, c, h, w)
+        crop_feats = super().forward(crops_flat)["features"]  # (B*4, 49, 512)
+        crop_feats = crop_feats.view(b, n_crops, self.num_objects, self.num_object_features)
+        local_summary = crop_feats.mean(dim=1)  # (B, 49, 512)
+
+        # Gate: sigmoid(MLP([global ‖ local])) per token → blended features
+        fused = self.scale_fusion(torch.cat([global_out["features"], local_summary], dim=-1))
+        return {"features": fused, "mask": global_out["mask"]}
 
 
 if __name__ == "__main__":
-    print("Testing SimpleObjectDetector...")
-    model = SimpleObjectDetector(num_object_features=128, max_objects=5)
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    dummy = torch.randn(2, 3, 320, 240)
-    outputs = model(dummy)
-    print(f"Features shape: {outputs['features'].shape}")
-    print(f"Mask shape: {outputs['mask'].shape}")
+    print("Testing CLIPViTEncoder and MultiScaleVisualEncoder...")
+    model = CLIPViTEncoder()
+    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,} "
+          f"(trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,})")
+    dummy = torch.randn(2, 3, 224, 224)
+    out = model(dummy)
+    print(f"Global features shape: {out['features'].shape}")
+
+    ms_model = MultiScaleVisualEncoder()
+    ms_out = ms_model(dummy, use_multiscale=True)
+    print(f"Multi-scale features shape: {ms_out['features'].shape}")
     print("Visual encoder test passed!")
+
+    print("\nTesting PLIP encoder...")
+    plip_model = CLIPViTEncoder(model_name="vinid/plip")
+    print(f"PLIP parameters: {sum(p.numel() for p in plip_model.parameters()):,} "
+          f"(trainable: {sum(p.numel() for p in plip_model.parameters() if p.requires_grad):,})")
+    plip_out = plip_model(dummy)
+    print(f"PLIP features shape: {plip_out['features'].shape}")
+    assert plip_out["features"].shape == (2, 49, 512)
+    print("PLIP encoder test passed!")

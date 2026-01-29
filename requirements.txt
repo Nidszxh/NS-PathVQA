@@ -1,6 +1,18 @@
-torch>=2.0.0
-torchvision>=0.15.0
-Pillow>=10.0.0
-tqdm>=4.60.0
-tensorboard>=2.10.0
-datasets>=2.14.0
+# Runtime dependencies — pinned to versions verified in the ~/.zangestu venv (Python 3.12.13)
+# Install with: uv pip install -r requirements.txt
+torch==2.12.1
+torchvision==0.27.1
+transformers==5.12.1        # Phase 3: CLIP visual + DistilBERT question encoders
+peft==0.20.0                # Phase 3: LoRA on frozen backbones
+accelerate==1.14.0          # peft/transformers training utilities
+datasets==5.0.0
+Pillow==12.3.0
+tqdm==4.68.3
+tensorboard==2.21.0
+fastapi==0.139.0              # P1: inference API
+uvicorn==0.49.0               # P1: ASGI server
+
+# Dev/test tooling (not needed at runtime)
+# pytest==9.1.1
+# ruff==0.15.20
+# mypy==2.3.0

@@ -1,18 +1,18 @@
-"""Main model definition: NeuroSymbolicPathVQA with cross-modal attention and optional symbolic path.
+"""NeuroSymbolicPathVQA: cross-modal attention with optional symbolic reasoning.
 
 Architecture:
-  1. Visual encoder: ResNet → object proposals → spatial encoding
-  2. Question encoder: biLSTM → question state vector
-  3. Cross-modal attention: attended visual features conditioned on question
-  4a. Neural path: fuse attended features + question state → MLP classifier
-  4b. Symbolic path (optional): SceneParser → scene logits → Executor → symbolic logits
+  1. Visual encoder: PLIP (or CLIP ViT-B/32) + LoRA → 49 patch tokens (768-d) → Linear 768→512
+  2. Question encoder: DistilBERT + LoRA → [CLS] state (768-d)
+  3. Cross-modal fusion: cross-attention transformer (question queries over patches)
+  4a. Neural path: MLP over [attended ‖ question_state] → answer logits
+  4b. Symbolic path: SceneParser → Executor → symbolic logits
 
-The symbolic path is additive: final_logits = neural_logits + weight * symbolic_logits
+Fusion modes: static additive or learned gate (N1).
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional
+from typing import Dict
 from pathlib import Path
 import sys
 
@@ -20,77 +20,39 @@ _src = str(Path(__file__).resolve().parent.parent)
 if _src not in sys.path:
     sys.path.append(_src)
 
-from models.visual.visual_encoder import SimpleObjectDetector
-from models.text.question_encoder import QuestionEncoder
+from models.visual.visual_encoder import CLIPViTEncoder, MultiScaleVisualEncoder
+from models.question.question_encoder import DistilBERTQuestionEncoder
+from models.fusion import CrossModalTransformer
 from symbolic.scene_parser import SceneParser
-
-
-class CrossModalAttention(nn.Module):
-    """Attention over visual features conditioned on the question state.
-
-    Uses concat+MLP scoring: scores = MLP([visual_features, question_state])
-    followed by softmax weighted sum over visual features.
-    """
-
-    def __init__(self, visual_dim: int, text_dim: int, hidden_dim: int = 512):
-        super().__init__()
-        self.attend = nn.Sequential(
-            nn.Linear(visual_dim + text_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, visual_features: torch.Tensor, question_state: torch.Tensor,
-                mask: torch.Tensor) -> torch.Tensor:
-        """Attend over visual features given a question.
-
-        Args:
-            visual_features: (batch, num_objects, visual_dim)
-            question_state: (batch, text_dim)
-            mask: (batch, num_objects) boolean mask for valid objects
-
-        Returns:
-            attended: (batch, visual_dim) question-conditioned visual summary
-        """
-        q = question_state.unsqueeze(1).expand(-1, visual_features.size(1), -1)
-        combined = torch.cat([visual_features, q], dim=-1)
-        scores = self.attend(combined).squeeze(-1)
-        scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
-        weights = torch.softmax(scores, dim=1)
-        attended = (weights.unsqueeze(-1) * visual_features).sum(dim=1)
-        return attended
+from symbolic.routing import LearnedGate
+from symbolic.dsl import DifferentiableDSLInterpreter, DSLProgramCompiler
 
 
 class NeuroSymbolicPathVQA(nn.Module):
-    """Full neuro-symbolic VQA model.
+    """Full neuro-symbolic VQA model: neural path + optional symbolic path."""
 
-    Combines a neural path (visual → question → attention → MLP) with an
-    optional symbolic path (scene parser → executor) for interpretable reasoning.
-    """
-
-    def __init__(self, vocab_size: int, answer_vocab_size: int,
-                 num_object_features: int = 512, max_objects: int = 10,
-                 spatial_feat_dim: int = 128, pretrained: bool = True,
-                 question_embedding_dim: int = 256,
-                 question_hidden_dim: int = 512, num_layers: int = 2,
+    def __init__(self, answer_vocab_size: int,
+                 num_object_features: int = 512,
+                 question_hidden_dim: int = 768,
                  dropout: float = 0.3,
                  symbolic_enabled: bool = True,
-                 num_regions: int = 50):
+                 num_regions: int = 50,
+                 visual_config: dict = None,
+                 question_config: dict = None,
+                 weighting_strategy: str = "static",
+                 attribute_mappings: dict = None):
         super().__init__()
         self.symbolic_enabled = symbolic_enabled
+        self.weighting_strategy = weighting_strategy
+        visual_config = visual_config or {}
+        question_config = question_config or {}
 
-        self.visual_encoder = SimpleObjectDetector(
-            num_object_features=num_object_features, max_objects=max_objects,
-            spatial_feat_dim=spatial_feat_dim, pretrained=pretrained,
-        )
-        self.question_encoder = QuestionEncoder(
-            vocab_size=vocab_size, embedding_dim=question_embedding_dim,
-            hidden_dim=question_hidden_dim, num_layers=num_layers,
-            dropout=dropout,
-        )
-        self.attention = CrossModalAttention(
-            visual_dim=num_object_features,
+        self.visual_encoder = CLIPViTEncoder(**visual_config)
+        self.question_encoder = DistilBERTQuestionEncoder(**question_config)
+        self.attention = CrossModalTransformer(
             text_dim=question_hidden_dim,
+            visual_dim=num_object_features,
+            hidden_dim=num_object_features,
         )
         fusion_dim = num_object_features + question_hidden_dim
         self.classifier = nn.Sequential(
@@ -105,27 +67,41 @@ class NeuroSymbolicPathVQA(nn.Module):
                 visual_dim=num_object_features,
                 num_regions=num_regions,
             )
+            self.dsl_compiler = DSLProgramCompiler()
+            self.dsl_interpreter = DifferentiableDSLInterpreter(
+                visual_dim=num_object_features,
+                attribute_mappings=attribute_mappings,
+            )
+            if weighting_strategy == "learned":
+                self.gate = LearnedGate(
+                    visual_dim=num_object_features,
+                    num_regions=num_regions,
+                    dropout=dropout,
+                )
 
-    def forward(self, images: torch.Tensor, question_indices: torch.Tensor,
-                question_lengths: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
-        """Forward pass: visual + question encoding → attention → neural + symbolic logits.
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable gradient checkpointing to trade compute for VRAM."""
+        self.visual_encoder.enable_gradient_checkpointing()
+        self.question_encoder.enable_gradient_checkpointing()
 
-        Args:
-            images: (batch, 3, H, W) normalized image tensors
-            question_indices: (batch, seq_len) padded token indices
-            question_lengths: (batch,) true lengths for pack_padded_sequence
+    def forward(self, images: torch.Tensor, input_ids: torch.Tensor,
+                attention_mask: torch.Tensor,
+                qtype_onehot: torch.Tensor = None,
+                use_multiscale: bool = False) -> Dict[str, torch.Tensor]:
+        """Forward pass: encode → cross-attention → neural + symbolic logits.
 
-        Returns:
-            Dict with answer_logits and, if symbolic enabled, scene_* logits
+        Neural path: classifier([attended ‖ question_state]) → answer_logits
+        Symbolic path: SceneParser → Executor → symbolic_logits (if enabled)
         """
-        visual = self.visual_encoder(images)
-        q = self.question_encoder(question_indices, question_lengths)
+        visual = self.visual_encoder(images, use_multiscale=use_multiscale)
+        q = self.question_encoder(input_ids, attention_mask)
         q_state = q["question_state"]
-        attended = self.attention(visual["features"], q_state, visual["mask"])
-        fused = torch.cat([attended, q_state], dim=-1)
-        answer_logits = self.classifier(fused)
+        attended, attn_weights = self.attention(q_state, visual["features"], visual["mask"])
+        fused = torch.cat([attended, q_state], dim=-1)        # (B, visual_dim + question_hidden_dim)
+        answer_logits = self.classifier(fused)                 # (B, answer_vocab_size)
 
-        result = {"answer_logits": answer_logits, "attended_features": attended}
+        result = {"answer_logits": answer_logits, "attended_features": attended,
+                  "patch_features": visual["features"]}
 
         if self.symbolic_enabled:
             scene = self.scene_parser(attended)
@@ -134,48 +110,80 @@ class NeuroSymbolicPathVQA(nn.Module):
             result["scene_color_logits"] = scene["color_logits"]
             result["scene_shape_logits"] = scene["shape_logits"]
             result["scene_size_logits"] = scene["size_logits"]
+            result["scene_density_logits"] = scene["density_logits"]
+
+            if self.weighting_strategy == "learned" and qtype_onehot is not None:
+                # Scene score: max object-presence sigmoid across regions → (B, 1)
+                c_scene = torch.sigmoid(scene["object_presence"]).max(dim=1, keepdim=True).values
+                gate = self.gate(attended, c_scene, qtype_onehot, attn_weights)
+                result["gate_values"] = gate
 
         return result
 
 
-def build_model(config, vocab_size, answer_vocab_size):
-    """Convenience factory: create NeuroSymbolicPathVQA from a Config object."""
-    return NeuroSymbolicPathVQA(
-        vocab_size=vocab_size,
+def build_model(config, answer_vocab_size, attribute_mappings=None):
+    """Create NeuroSymbolicPathVQA from a Config object."""
+    visual_kwargs = dict(
+        model_name=config.visual.model_name,
+        num_object_features=config.visual.num_object_features,
+        num_objects=config.visual.num_objects,
+        lora_rank=config.visual.lora_rank,
+        lora_alpha=config.visual.lora_alpha,
+        lora_target_modules=config.visual.lora_target_modules,
+    )
+    question_kwargs = dict(
+        model_name=config.question.model_name,
+        lora_rank=config.question.lora_rank,
+        lora_alpha=config.question.lora_alpha,
+        lora_target_modules=config.question.lora_target_modules,
+    )
+    model = NeuroSymbolicPathVQA(
         answer_vocab_size=answer_vocab_size,
         num_object_features=config.visual.num_object_features,
-        max_objects=config.visual.max_objects_per_image,
-        spatial_feat_dim=config.visual.spatial_feat_dim,
-        pretrained=config.visual.pretrained,
-        question_embedding_dim=config.question.embedding_dim,
         question_hidden_dim=config.question.hidden_dim,
-        num_layers=config.question.num_layers,
         dropout=config.question.dropout,
         symbolic_enabled=config.symbolic.enabled,
         num_regions=config.symbolic.num_regions,
+        visual_config=visual_kwargs,
+        question_config=question_kwargs,
+        weighting_strategy=config.symbolic.weighting_strategy,
+        attribute_mappings=attribute_mappings,
     )
+    # Replace visual encoder with MultiScaleVisualEncoder if configured
+    if getattr(config.visual, "use_multiscale", False):
+        model.visual_encoder = MultiScaleVisualEncoder(**visual_kwargs)
+    return model
 
 
 if __name__ == "__main__":
     print("Testing NeuroSymbolicPathVQA (neural only)...")
-    model = NeuroSymbolicPathVQA(vocab_size=100, answer_vocab_size=50,
-                                 num_object_features=128, max_objects=5,
-                                 symbolic_enabled=False)
+    model = NeuroSymbolicPathVQA(answer_vocab_size=50, symbolic_enabled=False)
     print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    images = torch.randn(2, 3, 320, 240)
-    q_idx = torch.randint(0, 100, (2, 10))
-    q_len = torch.tensor([8, 10])
-    outputs = model(images, q_idx, q_len)
+    images = torch.randn(2, 3, 224, 224)
+    input_ids = torch.randint(0, 30522, (2, 10))
+    attn_mask = torch.ones(2, 10, dtype=torch.long)
+    outputs = model(images, input_ids, attn_mask)
     print(f"Answer logits shape: {outputs['answer_logits'].shape}")
 
-    print("Testing with symbolic module...")
-    model2 = NeuroSymbolicPathVQA(vocab_size=100, answer_vocab_size=50,
-                                  num_object_features=128, max_objects=5,
-                                  symbolic_enabled=True, num_regions=10)
+    print("Testing with symbolic module (static fusion)...")
+    model2 = NeuroSymbolicPathVQA(answer_vocab_size=50, symbolic_enabled=True, num_regions=10)
     print(f"Parameters with symbolic: {sum(p.numel() for p in model2.parameters()):,}")
-    outputs2 = model2(images, q_idx, q_len)
+    outputs2 = model2(images, input_ids, attn_mask)
     print(f"Region logits shape: {outputs2['scene_region_logits'].shape}")
     print(f"Color logits shape: {outputs2['scene_color_logits'].shape}")
     print(f"Shape logits shape: {outputs2['scene_shape_logits'].shape}")
     print(f"Size logits shape: {outputs2['scene_size_logits'].shape}")
+
+    print("Testing with learned gate (entropy wired)...")
+    model3 = NeuroSymbolicPathVQA(
+        answer_vocab_size=50, symbolic_enabled=True, num_regions=10,
+        weighting_strategy="learned",
+    )
+    qtype_oh = torch.zeros(2, 5)
+    qtype_oh[:, 0] = 1.0  # identity
+    outputs3 = model3(images, input_ids, attn_mask, qtype_onehot=qtype_oh)
+    print(f"Gate values shape: {outputs3['gate_values'].shape}")
+    print(f"Gate range: [{outputs3['gate_values'].min():.4f}, {outputs3['gate_values'].max():.4f}]")
+    assert outputs3["attended_features"].shape == (2, 512)
+    assert outputs3["gate_values"].shape == (2, 1)
     print("PathVQA model test passed!")
