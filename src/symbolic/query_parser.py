@@ -1,38 +1,26 @@
-"""Rule-based question parser that classifies PathVQA questions into query types.
+"""Rule-based question parser: classifies questions and compiles DSL program ASTs.
 
-Uses regex patterns in priority order:
-  1. Attribute (color/shape/size/type)
-  2. Count (how many)
-  3. Yes/no (is/are/does/do/can/has/have/was/were)
-  4. Identity (what/which/identify)
-  5. Location (where/in which organ/system)
-
-Returns a structured Query dataclass with qtype, target, and optional attribute.
-
-The priority ordering ensures that questions matching multiple patterns
-are classified by the most specific type first. For example, "what color is the lesion?"
-matches both attribute and identity, but attribute is checked first.
+Priority: attribute > count > yes_no > identity > location > fallback (identity).
 """
 
-import re
 from dataclasses import dataclass
+import re
 from typing import List, Optional
+
+try:
+    from symbolic.dsl import DSLNode, DSLProgramCompiler
+except ImportError:
+    from dsl import DSLNode, DSLProgramCompiler
 
 
 @dataclass
 class Query:
-    """Structured representation of a parsed question.
-
-    Attributes:
-        qtype: Type of question (identity, location, yes_no, attribute, count)
-        target: Extracted target word/phrase from the question (if any)
-        attribute: For attribute questions, the attribute type (color/shape/size/type)
-        value: For attribute questions, the predicted value (populated after execution)
-    """
+    """Structured representation of a parsed question."""
     qtype: str
     target: str = ""
     attribute: str = ""
     value: str = ""
+    program: Optional[DSLNode] = None
 
 
 IDENTITY_PATTERNS = [
@@ -60,7 +48,7 @@ ATTRIBUTE_PATTERNS = {
 
 
 def _extract_target(question: str, answer_vocab: List[str]) -> str:
-    """Find the most specific word/phrase from the question that appears in the answer vocabulary."""
+    """Find the most specific word/phrase from the question in the answer vocabulary."""
     q = question.lower()
     words = set(re.findall(r"\b[a-z]+\b", q))
     for word in sorted(words, key=len, reverse=True):
@@ -75,17 +63,7 @@ def _extract_target(question: str, answer_vocab: List[str]) -> str:
 
 
 def parse_question(question: str, answer_vocab: Optional[List[str]] = None) -> Query:
-    """Classify a question string into a structured Query.
-
-    Pattern priority: attribute > count > yes_no > identity > location > default identity.
-
-    Args:
-        question: Raw question string
-        answer_vocab: List of known answer strings (for target extraction)
-
-    Returns:
-        Query with classified qtype and optionally extracted target/attribute
-    """
+    """Classify a question string and compile its corresponding DSL program AST."""
     q = question.lower().strip()
     answer_vocab = answer_vocab or []
     target = _extract_target(q, answer_vocab) if answer_vocab else ""
@@ -93,28 +71,34 @@ def parse_question(question: str, answer_vocab: Optional[List[str]] = None) -> Q
     # Attribute questions (checked first: "what color", "what shape", etc.)
     for attr, pattern in ATTRIBUTE_PATTERNS.items():
         if re.search(pattern, q):
-            return Query(qtype="attribute", target=target, attribute=attr)
+            prog = DSLProgramCompiler.compile(question, target=target, attribute=attr, qtype="attribute")
+            return Query(qtype="attribute", target=target, attribute=attr, program=prog)
 
-    # Count questions ("how many...")
+    # Count questions
     if re.search(r"^how many ", q):
-        return Query(qtype="count", target=target)
+        prog = DSLProgramCompiler.compile(question, target=target, qtype="count")
+        return Query(qtype="count", target=target, program=prog)
 
-    # Yes/no questions ("is/are/does this...")
+    # Yes/no questions
     if re.search(r"^(?:is|are|does|do|can|has|have|was|were) ", q):
-        return Query(qtype="yes_no", target=target)
+        prog = DSLProgramCompiler.compile(question, target=target, qtype="yes_no")
+        return Query(qtype="yes_no", target=target, program=prog)
 
-    # Identity questions ("what...", "identify...")
+    # Identity questions
     for pattern in IDENTITY_PATTERNS:
         if re.search(pattern, q):
-            return Query(qtype="identity", target=target)
+            prog = DSLProgramCompiler.compile(question, target=target, qtype="identity")
+            return Query(qtype="identity", target=target, program=prog)
 
-    # Location questions ("where...", "which organ...", "what region...")
+    # Location questions
     for pattern in LOCATION_PATTERNS:
         if re.search(pattern, q):
-            return Query(qtype="location", target=target)
+            prog = DSLProgramCompiler.compile(question, target=target, qtype="location")
+            return Query(qtype="location", target=target, program=prog)
 
-    # Default fallback: treat as identity question
-    return Query(qtype="identity", target=target)
+    # Fallback: identity
+    prog = DSLProgramCompiler.compile(question, target=target, qtype="identity")
+    return Query(qtype="identity", target=target, program=prog)
 
 
 if __name__ == "__main__":
@@ -129,5 +113,5 @@ if __name__ == "__main__":
     dummy_vocab = ["lesion", "malignant", "tumor", "nuclei", "cells"]
     for q in test_questions:
         result = parse_question(q, dummy_vocab)
-        print(f"  {q:45s} → qtype={result.qtype:10s} target={result.target:15s} attr={result.attribute}")
+        print(f"  {q:45s} → qtype={result.qtype:10s} target={result.target:15s} AST={result.program.op if result.program else None}")
     print("QueryParser test passed!")
