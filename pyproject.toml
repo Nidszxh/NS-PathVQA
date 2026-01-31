@@ -1,0 +1,24 @@
+# Tooling config only — NOT a packaging manifest (package conversion is parked).
+# Tests and lints run from the repo root.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "src"]
+addopts = "-q"
+filterwarnings = ["ignore:TruncatedFileError"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+exclude = ["data", "checkpoints", "logs", "outputs"]
+
+[tool.ruff.lint.per-file-ignores]
+# E402: intentional `sys.path.append` module-import pattern (dies in Phase 3)
+# F821: forward-reference string annotations not resolved by ruff
+"src/models/pathvqa_model.py" = ["E402"]
+"src/symbolic/executor.py" = ["E402"]
+"src/data/pathvqa_dataset.py" = ["F821"]
+
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+warn_unused_ignores = true

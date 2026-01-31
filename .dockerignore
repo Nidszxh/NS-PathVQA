@@ -1,0 +1,24 @@
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.git
+.gitignore
+.pytest_cache
+.ruff_cache
+.mypy_cache
+
+# Dev/test files
+tests/
+*.md
+LICENSE
+
+# Runtime data (mounted via volume)
+checkpoints/
+data/
+logs/
+outputs/
+
+# IDE
+.vscode/
+.idea/
