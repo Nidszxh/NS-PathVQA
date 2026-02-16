@@ -8,7 +8,7 @@ import re
 from typing import List, Optional
 
 try:
-    from symbolic.dsl import DSLNode, DSLProgramCompiler
+    from pathvqa.symbolic.dsl import DSLNode, DSLProgramCompiler
 except ImportError:
     from dsl import DSLNode, DSLProgramCompiler
 

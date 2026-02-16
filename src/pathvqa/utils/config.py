@@ -105,6 +105,9 @@ class SymbolicConfig:
     conformal_alpha: float = 0.1
     conformal_max_set_size: int = 1
     ontology_path: Optional[str] = None
+    query_parser: str = "learned"  # "regex" or "learned"
+    executor: str = "differentiable"  # "hard" or "differentiable"
+    qtype_warmup_epochs: int = 3
 
     def __post_init__(self):
         if isinstance(self.region_names, list):
@@ -225,6 +228,17 @@ def backfill_config(cfg: Config) -> Config:
             setattr(sub, name, getattr(default_sub, name))
         if hasattr(sub, "__post_init__"):
             sub.__post_init__()
+        
+        # Backward compatibility for Phase A-D transition
+        if sub_name == "symbolic" and hasattr(sub, "differentiable_pipeline"):
+            if getattr(sub, "differentiable_pipeline"):
+                sub.query_parser = "learned"
+                sub.executor = "differentiable"
+            else:
+                sub.query_parser = "regex"
+                sub.executor = "hard"
+            delattr(sub, "differentiable_pipeline")
+            
     return cfg
 
 

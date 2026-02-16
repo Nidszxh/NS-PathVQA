@@ -7,7 +7,7 @@ system to be close in embedding space, using the SNOMED-CT hierarchy.
 from typing import List, Set, Tuple
 import torch
 import torch.nn.functional as F
-from data.dataset_adapter import AnatomicalOntology
+from pathvqa.data.dataset_adapter import AnatomicalOntology
 
 
 def compute_sibling_regularization(

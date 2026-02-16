@@ -1,7 +1,7 @@
 """Unit tests for Logic Tensor Networks and Fuzzy Logic Operators."""
 
 import torch
-from symbolic.ltn import FuzzyLogicEngine, MedicalLogicTensorNetwork
+from pathvqa.symbolic.ltn import FuzzyLogicEngine, MedicalLogicTensorNetwork
 
 
 def test_fuzzy_logic_operators_range():

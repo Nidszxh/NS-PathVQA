@@ -9,7 +9,7 @@ Provides direct supervision signals to each SceneParser head:
 from typing import Dict, List
 import torch
 import torch.nn.functional as F
-from symbolic.executor import QTYPE_TO_INT
+from pathvqa.symbolic.executor import QTYPE_TO_INT
 
 
 def compute_symbolic_aux_losses(

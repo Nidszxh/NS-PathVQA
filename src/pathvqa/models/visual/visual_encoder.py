@@ -4,6 +4,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathvqa.models.protocols import VisualEncoderOutput
 from peft import LoraConfig, inject_adapter_in_model
 from transformers import CLIPVisionModel
 
@@ -52,8 +53,8 @@ class CLIPViTEncoder(nn.Module):
         if hasattr(self.backbone, "gradient_checkpointing_enable"):
             self.backbone.gradient_checkpointing_enable()
 
-    def forward(self, images: torch.Tensor, **kwargs) -> Dict[str, torch.Tensor]:
-        """Encode images into patch-token features. Returns 'features' (B, N, D) and 'mask' (B, N)."""
+    def forward(self, images: torch.Tensor, **kwargs) -> VisualEncoderOutput:
+        """Encode images into patch-token features."""
         batch_size = images.size(0)
         device = images.device
         out = self.backbone(pixel_values=images)
@@ -62,7 +63,14 @@ class CLIPViTEncoder(nn.Module):
         patches = patches[:, : self.num_objects, :]
         features = self.projection(patches)
         mask = torch.ones(batch_size, features.size(1), dtype=torch.bool, device=device)
-        return {"features": features, "mask": mask}
+        
+        # Shape assertions (P4)
+        assert features.shape == (batch_size, self.num_objects, self.num_object_features), \
+            f"Expected features (B, {self.num_objects}, {self.num_object_features}), got {features.shape}"
+        assert mask.shape == (batch_size, self.num_objects), \
+            f"Expected mask (B, {self.num_objects}), got {mask.shape}"
+            
+        return VisualEncoderOutput(features=features, mask=mask)
 
 
 class MultiScaleVisualEncoder(CLIPViTEncoder):
@@ -97,7 +105,7 @@ class MultiScaleVisualEncoder(CLIPViTEncoder):
         crops = [F.interpolate(q, size=(h, w), mode="bilinear", align_corners=False) for q in [q1, q2, q3, q4]]
         return torch.stack(crops, dim=1)  # (B, 4, C, H, W)
 
-    def forward(self, images: torch.Tensor, use_multiscale: bool = False) -> Dict[str, torch.Tensor]:
+    def forward(self, images: torch.Tensor, use_multiscale: bool = False) -> VisualEncoderOutput:
         global_out = super().forward(images)
         if not use_multiscale:
             return global_out
@@ -106,13 +114,13 @@ class MultiScaleVisualEncoder(CLIPViTEncoder):
         crops = self._extract_crops(images)  # (B, 4, 3, 224, 224)
         b, n_crops, c, h, w = crops.shape
         crops_flat = crops.view(b * n_crops, c, h, w)
-        crop_feats = super().forward(crops_flat)["features"]  # (B*4, 49, 512)
+        crop_feats = super().forward(crops_flat).features  # (B*4, 49, 512)
         crop_feats = crop_feats.view(b, n_crops, self.num_objects, self.num_object_features)
         local_summary = crop_feats.mean(dim=1)  # (B, 49, 512)
 
         # Gate: sigmoid(MLP([global ‖ local])) per token → blended features
-        fused = self.scale_fusion(torch.cat([global_out["features"], local_summary], dim=-1))
-        return {"features": fused, "mask": global_out["mask"]}
+        fused = self.scale_fusion(torch.cat([global_out.features, local_summary], dim=-1))
+        return VisualEncoderOutput(features=fused, mask=global_out.mask)
 
 
 if __name__ == "__main__":
@@ -122,11 +130,11 @@ if __name__ == "__main__":
           f"(trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,})")
     dummy = torch.randn(2, 3, 224, 224)
     out = model(dummy)
-    print(f"Global features shape: {out['features'].shape}")
+    print(f"Global features shape: {out.features.shape}")
 
     ms_model = MultiScaleVisualEncoder()
     ms_out = ms_model(dummy, use_multiscale=True)
-    print(f"Multi-scale features shape: {ms_out['features'].shape}")
+    print(f"Multi-scale features shape: {ms_out.features.shape}")
     print("Visual encoder test passed!")
 
     print("\nTesting PLIP encoder...")
@@ -134,6 +142,6 @@ if __name__ == "__main__":
     print(f"PLIP parameters: {sum(p.numel() for p in plip_model.parameters()):,} "
           f"(trainable: {sum(p.numel() for p in plip_model.parameters() if p.requires_grad):,})")
     plip_out = plip_model(dummy)
-    print(f"PLIP features shape: {plip_out['features'].shape}")
-    assert plip_out["features"].shape == (2, 49, 512)
+    print(f"PLIP features shape: {plip_out.features.shape}")
+    assert plip_out.features.shape == (2, 49, 512)
     print("PLIP encoder test passed!")

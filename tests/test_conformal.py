@@ -1,7 +1,7 @@
 """Tests for conformal prediction."""
 
 import torch
-from utils.conformal import ConformalPredictor, compute_conformal_metrics
+from pathvqa.utils.conformal import ConformalPredictor, compute_conformal_metrics
 
 
 def test_conformal_calibration():

@@ -1,5 +1,5 @@
 import torch
-from symbolic.routing import LearnedGate, encode_question_types, QTYPE_LIST, NUM_QTYPES
+from pathvqa.symbolic.routing import LearnedGate, encode_question_types, QTYPE_LIST, NUM_QTYPES
 
 
 def test_encode_question_types():

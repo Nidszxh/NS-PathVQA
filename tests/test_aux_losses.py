@@ -1,8 +1,8 @@
 """Tests for symbolic auxiliary losses."""
 
 import torch
-from symbolic.aux_losses import compute_symbolic_aux_losses
-from symbolic.scene_parser import COLOR_VALUES
+from pathvqa.symbolic.aux_losses import compute_symbolic_aux_losses
+from pathvqa.symbolic.scene_parser import COLOR_VALUES
 
 
 def _make_dummy_data():

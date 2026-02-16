@@ -32,19 +32,19 @@ class TestSchemas:
     """Validate Pydantic request/response schemas."""
 
     def test_predict_request(self):
-        from api.schemas import PredictRequest
+        from pathvqa.api.schemas import PredictRequest
         req = PredictRequest(image_base64="abc123", question="What organ is this?")
         assert req.image_base64 == "abc123"
         assert req.question == "What organ is this?"
 
     def test_predict_response(self):
-        from api.schemas import PredictResponse
+        from pathvqa.api.schemas import PredictResponse
         resp = PredictResponse(answer="lung", confidence=0.92, question_type="identity")
         assert resp.answer == "lung"
         assert resp.confidence == 0.92
 
     def test_explain_response(self):
-        from api.schemas import ExplainResponse, SymbolicTrace
+        from pathvqa.api.schemas import ExplainResponse, SymbolicTrace
         trace = SymbolicTrace(
             question_type="identity",
             target="lung",
@@ -67,12 +67,12 @@ class TestSchemas:
         assert "step_1_organ_identification" in resp.trace.reasoning_tree
 
     def test_health_response(self):
-        from api.schemas import HealthResponse
+        from pathvqa.api.schemas import HealthResponse
         resp = HealthResponse(checkpoint="model.pt", device="cpu")
         assert resp.status == "ok"
 
     def test_model_info_response(self):
-        from api.schemas import ModelInfoResponse
+        from pathvqa.api.schemas import ModelInfoResponse
         resp = ModelInfoResponse(
             checkpoint="model.pt", num_regions=10, num_answers=50,
             weighting_strategy="learned", symbolic_enabled=True, device="cpu",
@@ -95,13 +95,13 @@ class TestPreprocessing:
         assert img.size == (100, 80)
 
     def test_resize_keep_aspect_import(self):
-        from data.pathvqa_dataset import resize_keep_aspect
+        from pathvqa.data.pathvqa_dataset import resize_keep_aspect
         img = Image.new("RGB", (300, 200), color=(100, 100, 100))
         resized = resize_keep_aspect(img, (224, 224))
         assert resized.size == (224, 224)
 
     def test_clip_normalize_import(self):
-        from data.pathvqa_dataset import get_clip_normalize
+        from pathvqa.data.pathvqa_dataset import get_clip_normalize
         norm = get_clip_normalize()
         assert norm is not None
 

@@ -8,18 +8,14 @@ For each query type:
 """
 
 from pathlib import Path
-import sys
 from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 
-_src = str(Path(__file__).resolve().parent.parent)
-if _src not in sys.path:
-    sys.path.append(_src)
-
-from symbolic.query_parser import Query
-from symbolic.scene_parser import COLOR_VALUES, SHAPE_VALUES, SIZE_VALUES
-from data.dataset_adapter import AnatomicalOntology
+from pathvqa.symbolic.query_parser import Query
+from pathvqa.symbolic.scene_parser import COLOR_VALUES, SHAPE_VALUES, SIZE_VALUES
+from pathvqa.data.dataset_adapter import AnatomicalOntology
+from pathvqa.models.protocols import SceneParserOutput, ExecutorOutput
 
 
 # Anatomical region prefixes and simple organ names in PathVQA.
@@ -149,10 +145,10 @@ class VectorizedSymbolicExecutor(nn.Module):
 
     def forward(
         self,
-        scene_logits: Dict[str, torch.Tensor],
+        scene_logits: SceneParserOutput,
         queries: List[Query],
         neural_logits: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
+    ) -> ExecutorOutput:
         return execute(
             scene_logits=scene_logits,
             queries=queries,
@@ -174,7 +170,7 @@ QTYPE_TO_INT = {"identity": 0, "location": 1, "yes_no": 2, "attribute": 3, "coun
 
 
 def execute(
-    scene_logits: Dict[str, torch.Tensor],
+    scene_logits: SceneParserOutput,
     queries: List[Query],
     region_names: List[str],
     region_to_answer_idx: torch.Tensor,
@@ -183,7 +179,7 @@ def execute(
     answer_vocab_size: int,
     neural_logits: torch.Tensor,
     ontology: Optional[AnatomicalOntology] = None,
-) -> Dict[str, torch.Tensor]:
+) -> ExecutorOutput:
     """Execute symbolic reasoning: map scene logits to answer vocabulary.
 
     Fully vectorized over batch. Returns dict with symbolic_logits, region_logits, trace.
@@ -193,10 +189,10 @@ def execute(
 
     symbolic_logits = torch.zeros(batch_size, answer_vocab_size, device=device)
 
-    region_logits = scene_logits.get("scene_region_logits")
+    region_logits = scene_logits.region_logits
     if region_logits is None:
-        return {"symbolic_logits": symbolic_logits, "region_logits": None,
-                "trace": {"symbolic_used": [False] * batch_size}}
+        return ExecutorOutput(symbolic_logits=symbolic_logits, region_logits=None,
+                trace={"symbolic_used": [False] * batch_size})
 
     reg_map = region_to_answer_idx.to(device)     # (N_reg,) → maps region idx → answer vocab idx
     yes_idx = answer_to_idx.get("yes")
@@ -280,8 +276,7 @@ def execute(
         for idx in attr_indices:
             i = idx.item()
             query = queries[i]
-            attr_logits_key = f"scene_{query.attribute}_logits"
-            attr_logits = scene_logits.get(attr_logits_key)
+            attr_logits = getattr(scene_logits, f"{query.attribute}_logits", None)
             if attr_logits is not None and query.attribute in attribute_mappings:
                 mapping = attribute_mappings[query.attribute].to(device)
                 valid_attr_mask = mapping >= 0
@@ -292,11 +287,11 @@ def execute(
     # Build trace: count (4) is the only non-symbolic type
     symbolic_used = (qtype_ids != 4).tolist()
 
-    return {
-        "symbolic_logits": symbolic_logits,
-        "region_logits": region_logits,
-        "trace": {"symbolic_used": symbolic_used},
-    }
+    return ExecutorOutput(
+        symbolic_logits=symbolic_logits,
+        region_logits=region_logits,
+        trace={"symbolic_used": symbolic_used},
+    )
 
 
 if __name__ == "__main__":
@@ -309,13 +304,14 @@ if __name__ == "__main__":
     attr_mappings = build_attribute_mappings(answer_to_idx)
 
     batch_size = 2
-    scene_logits = {
-        "scene_region_logits": torch.randn(batch_size, len(region_names)),
-        "scene_object_presence": torch.sigmoid(torch.randn(batch_size, len(region_names))),
-        "scene_color_logits": torch.randn(batch_size, len(COLOR_VALUES)),
-        "scene_shape_logits": torch.randn(batch_size, len(SHAPE_VALUES)),
-        "scene_size_logits": torch.randn(batch_size, len(SIZE_VALUES)),
-    }
+    scene_logits = SceneParserOutput(
+        region_logits=torch.randn(batch_size, len(region_names)),
+        object_presence=torch.sigmoid(torch.randn(batch_size, len(region_names))),
+        color_logits=torch.randn(batch_size, len(COLOR_VALUES)),
+        shape_logits=torch.randn(batch_size, len(SHAPE_VALUES)),
+        size_logits=torch.randn(batch_size, len(SIZE_VALUES)),
+        density_logits=torch.randn(batch_size, 4),
+    )
     queries = [
         Query(qtype="identity", target="bone"),
         Query(qtype="location", target="gastrointestinal"),
@@ -324,22 +320,22 @@ if __name__ == "__main__":
 
     result = execute(scene_logits, queries, region_names, region_to_answer_idx,
                      attr_mappings, answer_to_idx, len(answer_vocab), neural_logits)
-    print(f"Symbolic logits shape: {result['symbolic_logits'].shape}")
-    print(f"Region logits shape: {result['region_logits'].shape}")
-    print(f"Symbolic used: {result['trace']['symbolic_used']}")
+    print(f"Symbolic logits shape: {result.symbolic_logits.shape}")
+    print(f"Region logits shape: {result.region_logits.shape}")
+    print(f"Symbolic used: {result.trace['symbolic_used']}")
 
     # Test VectorizedSymbolicExecutor wrapper
     vec_executor = VectorizedSymbolicExecutor(region_names, answer_to_idx, attr_mappings)
     vec_out = vec_executor(scene_logits, queries, neural_logits)
-    assert torch.allclose(result["symbolic_logits"], vec_out["symbolic_logits"])
+    assert torch.allclose(result.symbolic_logits, vec_out.symbolic_logits)
     print("Vectorized executor test passed!")
 
     # Test yes/no fix: should boost yes/no indices, not target word index
     queries_yn = [Query(qtype="yes_no", target="lung")]
     result_yn = execute(scene_logits, queries_yn, region_names, region_to_answer_idx,
                         attr_mappings, answer_to_idx, len(answer_vocab), neural_logits)
-    yn_val = result_yn["symbolic_logits"][0, answer_to_idx["yes"]]
-    no_val = result_yn["symbolic_logits"][0, answer_to_idx["no"]]
+    yn_val = result_yn.symbolic_logits[0, answer_to_idx["yes"]]
+    no_val = result_yn.symbolic_logits[0, answer_to_idx["no"]]
     print(f"  yes={yn_val:.4f}, no={no_val:.4f}")
     # Lung is a region name, so it maps to yes/no
     assert yn_val != 0.0 or no_val != 0.0, "yes/no should boost yes or no index"
@@ -352,17 +348,18 @@ if __name__ == "__main__":
         Query(qtype="attribute", attribute="color"),
         Query(qtype="count", target="nuclei"),
     ]
-    scene_mixed = {
-        "scene_region_logits": torch.randn(4, len(region_names)),
-        "scene_object_presence": torch.sigmoid(torch.randn(4, len(region_names))),
-        "scene_color_logits": torch.randn(4, len(COLOR_VALUES)),
-        "scene_shape_logits": torch.randn(4, len(SHAPE_VALUES)),
-        "scene_size_logits": torch.randn(4, len(SIZE_VALUES)),
-    }
+    scene_mixed = SceneParserOutput(
+        region_logits=torch.randn(4, len(region_names)),
+        object_presence=torch.sigmoid(torch.randn(4, len(region_names))),
+        color_logits=torch.randn(4, len(COLOR_VALUES)),
+        shape_logits=torch.randn(4, len(SHAPE_VALUES)),
+        size_logits=torch.randn(4, len(SIZE_VALUES)),
+        density_logits=torch.randn(4, 4),
+    )
     neural_mixed = torch.randn(4, len(answer_vocab))
     result_mixed = execute(scene_mixed, queries_mixed, region_names, region_to_answer_idx,
                            attr_mappings, answer_to_idx, len(answer_vocab), neural_mixed)
-    assert result_mixed["trace"]["symbolic_used"] == [True, True, True, False]
+    assert result_mixed.trace["symbolic_used"] == [True, True, True, False]
     print("Mixed qtype test passed!")
 
     print("All executor tests passed!")
