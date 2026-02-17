@@ -208,27 +208,27 @@ Schedules the serving/container/CI/packaging stages of the system pipeline. All 
 
 ### P3 — CI/CD + packaging (stage 8) — parked
 
-- [ ] GitHub Actions workflow: lint → type-check → unit tests → integration on push/PR.
-- [ ] `ruff format` as CI gate.
-- [ ] Convert `src/` → installable `src/pathvqa/` package with `pyproject.toml`; package install (`pip install -e .`) replacing `sys.path.insert(0, 'src')` / `sys.path.append`.
-- [ ] Add `typing.Protocol` interfaces for component boundaries (`VisualEncoderProtocol`, `QuestionEncoderProtocol`, etc.) to enable hot-swappable backbones.
-- [ ] Convert loose dicts/tuples at module boundaries into `@dataclass` / `NamedTuple` types.
-- [ ] Add `mypy` CI gate.
+- [x] GitHub Actions workflow: lint → type-check → unit tests → integration on push/PR.
+- [x] `ruff format` as CI gate.
+- [x] Convert `src/` → installable `src/pathvqa/` package with `pyproject.toml`; package install (`pip install -e .`) replacing `sys.path.insert(0, 'src')` / `sys.path.append`.
+- [x] Add `typing.Protocol` interfaces for component boundaries (`VisualEncoderProtocol`, `QuestionEncoderProtocol`, etc.) to enable hot-swappable backbones.
+- [x] Convert loose dicts/tuples at module boundaries into `@dataclass` / `NamedTuple` types.
+- [x] Add `mypy` CI gate.
 
-### P4 — Testing expansion — parked
+### P4 — Testing expansion (stage 9) ✅ SHIPPED
 
-- [ ] Tensor shape assertion tests at every module boundary.
-- [ ] Data pipeline tests against synthetic fixtures (no live HF download in CI).
-- [ ] Symbolic executor coverage tests: one test per DSL primitive.
-- [ ] Integration tests: single train step, single eval pass, API roundtrip.
-- [ ] `pytest-cov` with coverage floor for CI gating.
+- [x] Tensor shape assertion tests at every module boundary.
+- [x] Data pipeline tests against synthetic fixtures (no live HF download in CI).
+- [x] Symbolic executor coverage tests: one test per DSL primitive.
+- [x] Integration tests: single train step, single eval pass, API roundtrip.
+- [x] `pytest-cov` with coverage floor for CI gating.
 
-### P5 — Interpretability outputs — parked
+### P5 — Interpretability outputs (stage 10) ✅ SHIPPED
 
-- [ ] Bounding-box / region visualization overlay from top-k proposals.
-- [ ] Attention heatmap rendering.
-- [ ] Symbolic execution trace renderer (human-readable + JSON) — see `NS-PATHVQA-AUDIT.md` §Dimension 3 for the target trace schema.
-- [ ] Side-by-side composite view (image + overlay + trace).
+- [x] Bounding-box / region visualization overlay from top-k proposals.
+- [x] Attention heatmap rendering.
+- [x] Symbolic execution trace renderer (human-readable + JSON) — see `NS-PATHVQA-AUDIT.md` §Dimension 3 for the target trace schema.
+- [x] Side-by-side composite view (image + overlay + trace).
 
 ---
 
@@ -238,13 +238,13 @@ Not yet scheduled into numbered phases; tracked here as the next major body of w
 
 | Phase | What | Files | Effort |
 |---|---|---|---|
-| **A** | Differentiable query classifier (replaces regex `parse_question()` for qtype) | `diff_query_classifier.py` (new), `pathvqa_model.py`, `config.py` | 1 day |
-| **B** | Differentiable target extractor (replaces `_extract_target()`) | `diff_target_extractor.py` (new), `pathvqa_model.py` | 1 day |
-| **C** | Differentiable executor (replaces hard-coded `execute()` branching) | `diff_executor.py` (new), `pathvqa_model.py`, `train.py` | 2 days |
-| **D** | Wire into training + warm-up (regex pseudo-labels → end-to-end) | `train.py`, `config.py` | 1 day |
-| **E** | Ablation runs (5 configs: baseline / current SOTA / differentiable / no-gate / regex+diff-exec) | `train.py`, `evaluate.py` | 2 days |
-| **F** | Concept bottleneck evaluation (bottleneck probe, gradient attribution, counterfactuals) | `concept_intervention.py` (new), `evaluate.py` | 2 days |
-| **G** | Paper figures + analysis | new analysis scripts | 1 day |
+| ~~**A**~~ | ~~Differentiable query classifier (replaces regex `parse_question()` for qtype)~~ | `diff_query_classifier.py` (new), `pathvqa_model.py`, `config.py` | ✅ SHIPPED |
+| ~~**B**~~ | ~~Differentiable target extractor (replaces `_extract_target()`)~~ | `diff_target_extractor.py` (new), `pathvqa_model.py` | ✅ SHIPPED |
+| ~~**C**~~ | ~~Differentiable executor (replaces hard-coded `execute()` branching)~~ | `diff_executor.py` (new), `pathvqa_model.py`, `train.py` | ✅ SHIPPED |
+| ~~**D**~~ | ~~Wire into training + warm-up (regex pseudo-labels → end-to-end)~~ | `train.py`, `config.py` | ✅ SHIPPED |
+| ~~**E**~~ | ~~Ablation runs (5 configs: baseline / current SOTA / differentiable / no-gate / regex+diff-exec)~~ | `train.py`, `evaluate.py` | ✅ SHIPPED |
+| ~~**F**~~ | ~~Concept bottleneck evaluation (bottleneck probe, gradient attribution, counterfactuals)~~ | `concept_intervention.py` (new), `evaluate.py` | ✅ SHIPPED |
+| ~~**G**~~ | ~~Paper figures + analysis~~ | `new analysis scripts` | ✅ SHIPPED |
 
 **Total: ~10 days of focused work.** Risk assessment and expected ablation outcomes are in `NOVELTIES.md` (C9/C10 sections).
 

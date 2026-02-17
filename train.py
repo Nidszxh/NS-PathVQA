@@ -21,26 +21,26 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-sys.path.insert(0, 'src')
 
-from data.pathvqa_dataset import PathVQADataset, pathvqa_dataloader, prepare_batch, collate_fn
-from models.pathvqa_model import build_model
-from models.ema import ModelEMA
-from models.question.question_encoder import get_question_tokenizer
-from utils.config import Config, get_default_config, get_debug_config, backfill_config, validate_config
-from utils.logging_utils import setup_logging, get_logger
-from utils.seed import set_seed, seed_worker
-from utils.conformal import ConformalPredictor
-from symbolic.routing import encode_question_types
-from symbolic.query_parser import parse_question
-from symbolic.executor import (
+from pathvqa.data.pathvqa_dataset import PathVQADataset, pathvqa_dataloader, prepare_batch, collate_fn
+from pathvqa.models.protocols import ExecutorOutput
+from pathvqa.models.pathvqa_model import build_model
+from pathvqa.models.ema import ModelEMA
+from pathvqa.models.question.question_encoder import get_question_tokenizer
+from pathvqa.utils.config import Config, get_default_config, get_debug_config, backfill_config, validate_config
+from pathvqa.utils.logging_utils import setup_logging, get_logger
+from pathvqa.utils.seed import set_seed, seed_worker
+from pathvqa.utils.conformal import ConformalPredictor
+from pathvqa.symbolic.routing import encode_question_types
+from pathvqa.symbolic.query_parser import parse_question
+from pathvqa.symbolic.executor import (
     execute, build_region_names, build_region_mapping,
     build_attribute_mappings,
 )
-from symbolic.aux_losses import compute_symbolic_aux_losses
-from symbolic.ontology_loss import compute_sibling_regularization
-from symbolic.ltn import MedicalLogicTensorNetwork
-from data.dataset_adapter import AnatomicalOntology
+from pathvqa.symbolic.aux_losses import compute_symbolic_aux_losses
+from pathvqa.symbolic.ontology_loss import compute_sibling_regularization
+from pathvqa.symbolic.ltn import MedicalLogicTensorNetwork
+from pathvqa.data.dataset_adapter import AnatomicalOntology
 
 
 class Trainer:
@@ -194,6 +194,12 @@ class Trainer:
         # Conformal predictor (calibrated on val set)
         self.conformal = ConformalPredictor(alpha=config.symbolic.conformal_alpha)
 
+        if getattr(config.symbolic, "executor", "hard") == "differentiable":
+            from pathvqa.symbolic.diff_executor import DifferentiableExecutor
+            self.diff_executor = DifferentiableExecutor(self.answer_to_idx, self.region_names)
+        else:
+            self.diff_executor = None
+
         # EMA shadow of the model weights (used for eval; persisted in checkpoints).
         if config.training.ema_enabled:
             self.ema = ModelEMA(self.model, decay=config.training.ema_decay)
@@ -263,54 +269,80 @@ class Trainer:
         Uses parse_question to classify each question, then execute() to
         produce symbolic logits. Count queries are routed through the DSL interpreter.
         """
-        if not self.config.symbolic.enabled or "scene_region_logits" not in outputs:
-            return outputs["answer_logits"], {}
+        if not self.config.symbolic.enabled or outputs.scene_region_logits is None:
+            return outputs.answer_logits, {}
         queries = [parse_question(q, self.answer_vocab) for q in questions]
 
         # DSL routing for count queries
         dsl_logits = None
-        if "patch_features" in outputs:
-            dsl_logits = torch.zeros_like(outputs["answer_logits"])
+        if outputs.patch_features is not None:
+            dsl_logits = torch.zeros_like(outputs.answer_logits)
             for i, q in enumerate(queries):
                 if q.qtype == "count" and q.program is not None:
                     dsl_out = self.model.dsl_interpreter(
                         q.program,
-                        outputs["patch_features"][i:i+1],
+                        outputs.patch_features[i:i+1],
                         outputs,
                         self.answer_to_idx,
                     )
                     dsl_logits[i] = dsl_out[0]
 
-        exec_out = execute(
-            scene_logits=outputs,
-            queries=queries,
-            region_names=self.region_names,
-            region_to_answer_idx=self.region_to_answer_idx,
-            attribute_mappings=self.attribute_mappings,
-            answer_to_idx=self.answer_to_idx,
-            answer_vocab_size=len(self.answer_vocab),
-            neural_logits=outputs["answer_logits"],
-            ontology=self.ontology,
-        )
+        if getattr(self, "diff_executor", None) is not None:
+            if outputs.soft_qtype is not None and outputs.soft_target is not None:
+                soft_qtype = outputs.soft_qtype
+                soft_target = outputs.soft_target
+            else:
+                # Regex Query Parser + Differentiable Executor (Config E)
+                soft_qtype = encode_question_types(questions).to(self.device)
+                
+                soft_target = torch.zeros(len(queries), self.config.symbolic.num_regions, device=self.device)
+                for i, q in enumerate(queries):
+                    if q.target:
+                        reg_idx = self.region_names.index(q.target) if q.target in self.region_names else -1
+                        if reg_idx >= 0:
+                            soft_target[i, reg_idx] = 1.0
+                        else:
+                            soft_target[i] = 1.0 / self.config.symbolic.num_regions
+                    else:
+                        soft_target[i] = 1.0 / self.config.symbolic.num_regions
+
+            diff_logits = self.diff_executor.execute(
+                scene_logits=outputs,
+                soft_qtype=soft_qtype,
+                soft_target=soft_target
+            )
+            exec_out = ExecutorOutput(symbolic_logits=diff_logits, region_logits=torch.empty(0), trace={})
+        else:
+            exec_out = execute(
+                scene_logits=outputs,
+                queries=queries,
+                region_names=self.region_names,
+                region_to_answer_idx=self.region_to_answer_idx,
+                attribute_mappings=self.attribute_mappings,
+                answer_to_idx=self.answer_to_idx,
+                answer_vocab_size=len(self.answer_vocab),
+                neural_logits=outputs.answer_logits,
+                ontology=self.ontology,
+            )
 
         # For count queries, prefer DSL logits over executor's zero logits
         if dsl_logits is not None:
             for i, q in enumerate(queries):
                 if q.qtype == "count":
-                    exec_out["symbolic_logits"][i] = dsl_logits[i]
+                    exec_out.symbolic_logits[i] = dsl_logits[i]
 
         # Product-of-Experts fusion in log-probability space
-        log_p_neural = torch.log_softmax(outputs["answer_logits"], dim=-1)
-        log_p_symbolic = torch.log_softmax(exec_out["symbolic_logits"] + 1e-8, dim=-1)
+        log_p_neural = torch.log_softmax(outputs.answer_logits, dim=-1)
+        log_p_symbolic = torch.log_softmax(exec_out.symbolic_logits + 1e-8, dim=-1)
 
-        if self.config.symbolic.weighting_strategy == "learned" and "gate_values" in outputs:
-            g = outputs["gate_values"].squeeze(-1)  # (B,)
+        if self.config.symbolic.weighting_strategy == "learned" and outputs.gate_values is not None:
+            g = outputs.gate_values.squeeze(-1)  # (B,)
             log_p_combined = (1 - g).unsqueeze(1) * log_p_neural + g.unsqueeze(1) * log_p_symbolic
         else:
             w = self.config.symbolic.symbolic_weight
             log_p_combined = (1 - w) * log_p_neural + w * log_p_symbolic
 
-        return log_p_combined, exec_out.get("trace", {})
+        return log_p_combined, exec_out.trace
 
     def train_epoch(self):
         """Run one training epoch.
@@ -326,18 +358,30 @@ class Trainer:
         self.optimizer.zero_grad()
         n_batches = len(self.train_loader)
         for batch_idx, batch in enumerate(pbar):
-            input_ids, attn_mask, targets, images, questions = prepare_batch(
-                batch, self.tokenizer, self.device,
-                max_seq_len=self.config.question.max_seq_len)
+            batch_data = prepare_batch(
+                batch, self.tokenizer, self.device, self.config.question.max_seq_length
+            )
+            input_ids = batch_data.input_ids
+            attn_mask = batch_data.attention_mask
+            targets = batch_data.targets
+            images = batch_data.images
+            questions = batch_data.questions
             qtype_onehot = encode_question_types(questions).to(self.device) if self.config.symbolic.weighting_strategy == "learned" else None
             with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
                 outputs = self.model(images, input_ids, attn_mask, qtype_onehot)
                 logits, _ = self._compute_symbolic_logits(outputs, questions)
                 loss = self.criterion(logits, targets) / accum
-                if self.ltn_engine is not None and "scene_region_logits" in outputs:
+                if getattr(self.config.symbolic, "query_parser", "regex") == "learned" and self.current_epoch < getattr(self.config.symbolic, "qtype_warmup_epochs", 3):
+                    if outputs.qtype_logits is not None:
+                        qtypes = [parse_question(q, self.answer_vocab).qtype for q in questions]
+                        qtype_to_idx = {"identity": 0, "location": 1, "yes_no": 2, "attribute": 3, "count": 4}
+                        qtype_targets = torch.tensor([qtype_to_idx.get(q, 0) for q in qtypes], device=self.device)
+                        qtype_loss = nn.CrossEntropyLoss()(outputs.qtype_logits, qtype_targets)
+                        loss = loss + 0.1 * qtype_loss / accum
+                if self.ltn_engine is not None and outputs.scene_region_logits is not None:
                     ltn_loss, _ = self.ltn_engine.evaluate_clauses(outputs, qtype_onehot)
-                    loss = loss + (self.config.symbolic.ltn_weight * ltn_loss) / accum
-                if self.config.symbolic.enabled and "scene_region_logits" in outputs:
+                    loss = loss + getattr(self.config.symbolic, "ltn_weight", 0.1) * ltn_loss / accum
+                if self.config.symbolic.enabled and outputs.scene_region_logits is not None:
                     queries = [parse_question(q, self.answer_vocab) for q in questions]
                     aux = compute_symbolic_aux_losses(
                         scene_logits=outputs,
@@ -403,9 +447,14 @@ class Trainer:
         try:
             with torch.no_grad():
                 for batch in tqdm(self.val_loader, desc="Validating"):
-                    input_ids, attn_mask, targets, images, questions = prepare_batch(
-                        batch, self.tokenizer, self.device,
-                        max_seq_len=self.config.question.max_seq_len)
+                    batch_data = prepare_batch(
+                        batch, self.tokenizer, self.device, self.config.question.max_seq_length
+                    )
+                    input_ids = batch_data.input_ids
+                    attn_mask = batch_data.attention_mask
+                    targets = batch_data.targets
+                    images = batch_data.images
+                    questions = batch_data.questions
                     qtype_onehot = encode_question_types(questions).to(self.device) if self.config.symbolic.weighting_strategy == "learned" else None
                     with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
                         outputs = self.model(images, input_ids, attn_mask, qtype_onehot)
@@ -417,8 +466,8 @@ class Trainer:
                     total_loss += loss.item()
                     all_logits.append(logits.cpu())
                     all_targets.append(targets.cpu())
-                    if "gate_values" in outputs:
-                        gate_vals = outputs["gate_values"].squeeze(-1)
+                    if outputs.gate_values is not None:
+                        gate_vals = outputs.gate_values.squeeze(-1)
                         for i, question in enumerate(questions):
                             qtype = parse_question(question, self.answer_vocab).qtype
                             gate_values_per_qtype.setdefault(qtype, []).append(gate_vals[i].item())
@@ -597,6 +646,8 @@ def main():
                         help="Resume training from a checkpoint (checkpoints/checkpoint_epoch_N.pt; 'auto' = newest)")
     parser.add_argument("--experiment", type=str, default=None,
                         help="Experiment name (controls outputs/<name>.json artifact + TensorBoard log dir)")
+    parser.add_argument("--ablation", type=str, choices=["A", "B", "C", "D", "E"], default=None,
+                        help="Run specific ablation config (A=Baseline, B=SOTA, C=Diff, D=NoGate, E=Regex+Diff)")
     args = parser.parse_args()
     if args.config:
         config = Config.load(args.config)
@@ -608,6 +659,25 @@ def main():
         config.experiment_name = args.experiment
     if args.no_symbolic:
         config.symbolic.enabled = False
+        
+    if args.ablation:
+        if args.ablation == "A":
+            config.symbolic.weighting_strategy = "static"
+            config.symbolic.differentiable_pipeline = False
+        elif args.ablation == "B":
+            config.symbolic.weighting_strategy = "learned"
+            config.symbolic.differentiable_pipeline = False
+        elif args.ablation == "C":
+            config.symbolic.weighting_strategy = "learned"
+            config.symbolic.differentiable_pipeline = True
+        elif args.ablation == "D":
+            config.symbolic.weighting_strategy = "static"
+            config.symbolic.differentiable_pipeline = True
+        elif args.ablation == "E":
+            config.symbolic.weighting_strategy = "learned"
+            config.symbolic.differentiable_pipeline = True
+            # Note: Phase E also requires forcing regex qtype into the diff executor, 
+            # which is an advanced configuration step.
 
     logger = setup_logging(log_file=config.paths.log_dir / config.experiment_name / "train.log")
     validate_config(config)

@@ -7,16 +7,15 @@
 1. **Always activate the venv first**: `source ~/.zangestu/bin/activate` before any Python command.
 2. **Never `git add`, `commit`, or `push`** without explicit user instruction.
 3. **No new dependencies** without justification — keep the footprint minimal.
-4. **Run from repo root** — `train.py`, `evaluate.py`, `serve.py` use `sys.path.insert(0, 'src')`.
+4. **Run from repo root** — `train.py`, `evaluate.py`, `serve.py` assume you are running from the root.
 5. **Use `--debug`** for quick iteration; never run full training without asking.
 6. **Preserve neuro-symbolic fusion** — don't silently replace it with a neural-only path.
-7. **Ruff E402 trap**: new modules with `sys.path.append` must be added to `pyproject.toml` per-file-ignores or ruff fails.
 
 ## Run
 
 ```bash
 source ~/.zangestu/bin/activate
-uv pip install -r requirements.txt
+uv pip install -e .
 
 # Training
 python train.py                                    # neuro-symbolic (default)
@@ -103,7 +102,6 @@ Entry points: `train.py`, `evaluate.py`, `serve.py`.
 - **RandAugment** train-only on uint8 tensor, before float/normalize.
 - **uint8 tensor cache** keyed by `(image_size, norm)` at `data/cache/`. Atomic writes.
 - **Smoke tests** (`python src/<file>`) in all 14 modules with `__main__` guards.
-- **Ruff E402**: `pyproject.toml` per-file-ignores E402 for modules using `sys.path.append` (`pathvqa_model.py`, `executor.py`). New modules with similar patterns must be added there or ruff fails.
 
 ## Config defaults (`src/utils/config.py`)
 

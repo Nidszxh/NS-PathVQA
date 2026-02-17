@@ -227,7 +227,7 @@ Two directions to strengthen the paper's research contribution beyond engineerin
 - `DifferentiableTargetExtractor`: cross-attention soft alignment between question and anatomical regions (replaces `_extract_target()`)
 - `DifferentiableExecutor`: weighted blend of per-type execution strategies, all differentiable (replaces hard `if/else` branches)
 
-**Status:** [ ] Planned — full spec below.
+**Status:** [x] Implemented — full spec below. (Tests added in Phase A-D verification).
 
 **Why it's the strongest novelty:** NS-CL and Neural Module Networks do differentiable program execution on CLEVR/natural images. Nobody has done it for medical VQA with anatomical ontology grounding. The current non-differentiable break (documented in `NS-PATHVQA-AUDIT.md` §2.2 as a "gradient dead end") is the single biggest gap in the system.
 

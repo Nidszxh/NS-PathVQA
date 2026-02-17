@@ -204,7 +204,7 @@ Milestone commits (oldest → newest):
 
 - **Working**: full training (`train.py`), evaluation (`evaluate.py`), neural-only baseline (`--no-symbolic`), learned-gate ablation (`--weighting-strategy static|learned`), debug mode, custom configs, 14 `__main__` smoke tests + unit suite (105 pytest tests).
 - **Completed features**: learned gated fusion (C1), differentiable LTN auxiliary loss (C2), resource-efficiency narrative (C3), ontology-grounded region discovery (C4), DSL soft-counting (C5, standalone), multi-scale visual encoding (C6, off by default), architecture-grounded failure taxonomy (C7), calibrated evaluation with statistical significance (C8), AMP training, EMA, gradient accumulation + checkpointing, uint8 tensor cache, RandAugment, checkpoint management, early stopping, TensorBoard + structured logging.
-- **Planned** (`TODO.md` Production track): CI/CD (ruff → mypy → pytest → integration), packaging (`pip install -e .`, drop `sys.path.append`), fully differentiable neuro-symbolic pipeline (C9), concept bottleneck intervention testing (C10) — see `NOVELTIES.md` for specs.
+- **Planned** (`TODO.md` Production track): CI/CD (ruff → mypy → pytest → integration), packaging (`pip install -e .`), fully differentiable neuro-symbolic pipeline (C9), concept bottleneck intervention testing (C10) — see `NOVELTIES.md` for specs.
 - **Deliberately parked** (out of critical path, recorded in `TODO.md`): DSL program parsing wired into training, real count/spatial/comparative reasoning (count questions remain neural-only), scene-graph rewrite, SLAKE/RAD-VQA training runs, probabilistic logic fusion, testing/CI expansion, package restructuring.
 - **Known simplification**: the executor skips `count` questions (no meaningful symbolic signal).
 
@@ -217,14 +217,14 @@ Milestone commits (oldest → newest):
 uv venv ~/.zangestu && source ~/.zangestu/bin/activate
 
 # 2. Install dependencies (pinned with == for reproducibility)
-uv pip install -r requirements.txt    # torch 2.12.1, torchvision, transformers 5.12.1, peft 0.20.0, datasets, Pillow, tqdm, tensorboard, accelerate, fastapi, uvicorn
+uv pip install -e .    # torch 2.12.1, torchvision, transformers 5.12.1, peft 0.20.0, datasets, Pillow, tqdm, tensorboard, accelerate, fastapi, uvicorn
 
 # 3. Add new deps with
 uv pip install <pkg>
 ```
 
 - The venv lives at `/home/nidszxh/.zangestu/` (gitignored).
-- **Always run scripts from repo root** — `train.py`, `evaluate.py`, and `serve.py` hardcode `sys.path.insert(0, 'src')`.
+- **Always run scripts from repo root** — `train.py`, `evaluate.py`, and `serve.py` assume you are running from the root.
 - Data and output directories (`checkpoints/`, `logs/`, `outputs/`, `data/`) are gitignored and auto-created.
 - Data auto-downloads from `flaviagiammarino/path-vqa` on HF; `HF_HOME` is pinned to gitignored `data/hf-cache/` inside `pathvqa_dataset.py`, so caches aren't lost.
 - Image modes are mixed (CMYK/RGB/L) — `.convert("RGB")` handles all; don't remove.
