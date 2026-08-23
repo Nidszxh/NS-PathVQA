@@ -1,6 +1,6 @@
 from pathlib import Path
 import pytest
-from utils.config import (
+from pathvqa.utils.config import (
     Config, SymbolicConfig, get_debug_config, get_default_config, PathConfig,
     backfill_config, validate_config,
 )

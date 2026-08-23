@@ -1,4 +1,4 @@
-from symbolic.query_parser import parse_question
+from pathvqa.symbolic.query_parser import parse_question
 
 
 def test_attribute_question_color():

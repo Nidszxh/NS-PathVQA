@@ -1,6 +1,6 @@
 """Unit tests for AnatomicalOntology and DatasetAdapters (PathVQA, VQA-RAD, SLAKE)."""
 
-from data.dataset_adapter import (
+from pathvqa.data.dataset_adapter import (
     AnatomicalOntology,
     PathVQAAdapter,
     SLAKEAdapter,

@@ -12,20 +12,17 @@ Endpoints:
 """
 
 import os
-import sys
 import argparse
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-sys.path.insert(0, "src")
-
 from fastapi import FastAPI, HTTPException
 
-from api.schemas import (
+from pathvqa.api.schemas import (
     PredictRequest, PredictResponse, ExplainResponse,
     HealthResponse, ModelInfoResponse, SymbolicTrace,
 )
-from api.inference import PathVQAInference
+from pathvqa.api.inference import PathVQAInference
 
 # Set by startup; loaded once and reused across requests.
 _inference: PathVQAInference | None = None

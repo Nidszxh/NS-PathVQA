@@ -1,9 +1,9 @@
 """Tests for ontology-conditioned executor and sibling regularizer."""
 
-from data.dataset_adapter import AnatomicalOntology
-from symbolic.executor import ontology_fallback, execute, build_region_mapping, build_attribute_mappings
-from symbolic.ontology_loss import compute_sibling_regularization
-from symbolic.query_parser import Query
+from pathvqa.data.dataset_adapter import AnatomicalOntology
+from pathvqa.symbolic.executor import ontology_fallback, execute, build_region_mapping, build_attribute_mappings
+from pathvqa.symbolic.ontology_loss import compute_sibling_regularization
+from pathvqa.symbolic.query_parser import Query
 import torch
 
 

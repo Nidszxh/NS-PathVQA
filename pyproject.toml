@@ -1,9 +1,36 @@
-# Tooling config only — NOT a packaging manifest (package conversion is parked).
-# Tests and lints run from the repo root.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pathvqa"
+version = "0.1.0"
+description = "Neuro-Symbolic PathVQA"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.12.1",
+    "transformers>=5.12.1",
+    "peft>=0.20.0",
+    "fastapi>=0.139.0",
+    "uvicorn>=0.49.0",
+    "matplotlib>=3.7.0",
+    "pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.15",
+    "mypy>=1.0",
+    "httpx>=0.20",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = [".", "src"]
-addopts = "-q"
+pythonpath = ["src"]
+addopts = "-q --cov=src/pathvqa --cov-report=xml --cov-fail-under=80"
 filterwarnings = ["ignore:TruncatedFileError"]
 
 [tool.ruff]
@@ -12,13 +39,11 @@ line-length = 120
 exclude = ["data", "checkpoints", "logs", "outputs"]
 
 [tool.ruff.lint.per-file-ignores]
-# E402: intentional `sys.path.append` module-import pattern (dies in Phase 3)
 # F821: forward-reference string annotations not resolved by ruff
-"src/models/pathvqa_model.py" = ["E402"]
-"src/symbolic/executor.py" = ["E402"]
-"src/data/pathvqa_dataset.py" = ["F821"]
+"src/pathvqa/data/pathvqa_dataset.py" = ["F821"]
 
 [tool.mypy]
 python_version = "3.12"
 mypy_path = "src"
 warn_unused_ignores = true
+strict = true

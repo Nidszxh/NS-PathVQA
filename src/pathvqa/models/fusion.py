@@ -52,8 +52,13 @@ class CrossModalTransformer(nn.Module):
         attended = attended.reshape(batch, self.head_dim * self.num_heads)
         attended = self.out_proj(attended)
         attended = self.norm(self.dropout(attended))
-        # Residual connection + FFN
-        return attended + self.ffn(attended), weights
+        out = attended + self.ffn(attended)
+        
+        # Shape assertions (P4)
+        assert out.shape == (batch, self.head_dim * self.num_heads)
+        assert weights.shape == (batch, self.num_heads, 1, num_objects)
+        
+        return out, weights
 
 
 if __name__ == "__main__":

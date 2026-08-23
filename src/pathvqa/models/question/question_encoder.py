@@ -3,6 +3,7 @@
 from typing import Dict
 import torch
 import torch.nn as nn
+from pathvqa.models.protocols import QuestionEncoderOutput
 from peft import LoraConfig, inject_adapter_in_model
 from transformers import AutoModel, AutoTokenizer
 
@@ -34,12 +35,18 @@ class DistilBERTQuestionEncoder(nn.Module):
             self.backbone.gradient_checkpointing_enable()
 
     def forward(self, input_ids: torch.Tensor,
-                attention_mask: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Encode questions into fixed-size state vectors. Returns 'question_state' (B, 768)."""
+                attention_mask: torch.Tensor) -> QuestionEncoderOutput:
+        """Encode questions into fixed-size state vectors."""
         out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
         # Extract [CLS] token (index 0) as the question state representation
         question_state = out.last_hidden_state[:, 0, :]
-        return {"question_state": question_state}
+        
+        # Shape assertions (P4)
+        batch_size = input_ids.size(0)
+        assert question_state.shape == (batch_size, self.hidden_dim), \
+            f"Expected question_state (B, {self.hidden_dim}), got {question_state.shape}"
+            
+        return QuestionEncoderOutput(question_state=question_state)
 
 
 def get_question_tokenizer(model_name: str = "distilbert-base-uncased"):
@@ -56,5 +63,5 @@ if __name__ == "__main__":
     dummy_ids = torch.randint(0, tokenizer.vocab_size, (4, 10))
     dummy_mask = torch.ones(4, 10, dtype=torch.long)
     outputs = model(dummy_ids, dummy_mask)
-    print(f"State shape: {outputs['question_state'].shape}")
+    print(f"State shape: {outputs.question_state.shape}")
     print("Question encoder test passed!")

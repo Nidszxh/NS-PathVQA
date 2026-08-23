@@ -6,7 +6,7 @@ Predicts: region logits, object presence per region, and attribute logits
 
 import torch
 import torch.nn as nn
-from typing import Dict
+from pathvqa.models.protocols import SceneParserOutput
 
 
 COLOR_VALUES = ["yellow", "red", "grey", "white", "blue", "pale", "black",
@@ -38,7 +38,7 @@ class SceneParser(nn.Module):
         # Nuclei density head (domain-specific for histopathology)
         self.density_classifier = nn.Linear(visual_dim, len(DENSITY_VALUES))
 
-    def forward(self, attended_features: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, attended_features: torch.Tensor) -> SceneParserOutput:
         """Predict scene attributes from attended features."""
         region_logits = self.region_classifier(attended_features)
         object_logits = torch.sigmoid(self.object_classifier(attended_features))
@@ -46,14 +46,23 @@ class SceneParser(nn.Module):
         shape_logits = self.shape_classifier(attended_features)
         size_logits = self.size_classifier(attended_features)
         density_logits = self.density_classifier(attended_features)
-        return {
-            "region_logits": region_logits,
-            "object_presence": object_logits,
-            "color_logits": color_logits,
-            "shape_logits": shape_logits,
-            "size_logits": size_logits,
-            "density_logits": density_logits,
-        }
+        
+        # Shape assertions (P4)
+        batch = attended_features.size(0)
+        assert region_logits.shape == (batch, self.num_regions)
+        assert object_logits.shape == (batch, self.num_regions)
+        assert color_logits.shape == (batch, len(COLOR_VALUES))
+        assert shape_logits.shape == (batch, len(SHAPE_VALUES))
+        assert size_logits.shape == (batch, len(SIZE_VALUES))
+        assert density_logits.shape == (batch, len(DENSITY_VALUES))
+        return SceneParserOutput(
+            region_logits=region_logits,
+            object_presence=object_logits,
+            color_logits=color_logits,
+            shape_logits=shape_logits,
+            size_logits=size_logits,
+            density_logits=density_logits,
+        )
 
 
 if __name__ == "__main__":

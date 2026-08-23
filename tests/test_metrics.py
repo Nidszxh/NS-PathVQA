@@ -1,5 +1,5 @@
 import torch
-from utils.metrics import (
+from pathvqa.utils.metrics import (
     expected_calibration_error,
     paired_bootstrap_test,
     compute_uncertainty,

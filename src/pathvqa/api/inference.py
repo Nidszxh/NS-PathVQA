@@ -11,20 +11,17 @@ from typing import Dict, Tuple
 import PIL.Image
 import torch
 
-import sys
 
-sys.path.append("src")
-
-from data.pathvqa_dataset import get_clip_normalize, resize_keep_aspect
-from models.pathvqa_model import build_model
-from models.question.question_encoder import get_question_tokenizer
-from symbolic.query_parser import parse_question
-from symbolic.executor import (
+from pathvqa.data.pathvqa_dataset import get_clip_normalize, resize_keep_aspect
+from pathvqa.models.pathvqa_model import build_model
+from pathvqa.models.question.question_encoder import get_question_tokenizer
+from pathvqa.symbolic.query_parser import parse_question
+from pathvqa.symbolic.executor import (
     execute, build_region_names, build_region_mapping, build_attribute_mappings,
 )
-from symbolic.routing import encode_question_types
-from data.dataset_adapter import AnatomicalOntology
-from utils.config import backfill_config
+from pathvqa.symbolic.routing import encode_question_types
+from pathvqa.data.dataset_adapter import AnatomicalOntology
+from pathvqa.utils.config import backfill_config
 
 
 class PathVQAInference:
@@ -137,14 +134,14 @@ class PathVQAInference:
         # Build trace
         region_scores = None
         region_names_top = None
-        if "scene_region_logits" in outputs:
-            region_logits = outputs["scene_region_logits"][0]  # (num_regions,)
+        if outputs.scene_region_logits is not None:
+            region_logits = outputs.scene_region_logits[0]  # (num_regions,)
             topk = min(5, len(self.region_names))
             values, indices = region_logits.topk(topk)
             region_scores = [round(v.item(), 4) for v in values]
             region_names_top = [self.region_names[i] for i in indices]
 
-        from utils.interpretability import (
+        from pathvqa.utils.interpretability import (
             generate_visual_grounding_map,
             generate_counterfactual_explanation,
             generate_hierarchical_reasoning_tree,
@@ -152,10 +149,11 @@ class PathVQAInference:
 
         grounding_boxes = None
         patch_indices = None
-        if "attended_features" in outputs:
-            g_map = generate_visual_grounding_map(outputs["attended_features"][0], grid_size=(7, 7), top_k=3)
+        if outputs.attention_weights is not None:
+            g_map = generate_visual_grounding_map(outputs.attention_weights[0], grid_size=(7, 7), top_k=3)
             grounding_boxes = g_map["top_boxes"]
             patch_indices = g_map.get("patch_indices")
+            heatmap_2d = g_map.get("grid_heatmap")
 
         cf_explanation = generate_counterfactual_explanation(
             baseline_prediction_str=answer,
@@ -187,6 +185,7 @@ class PathVQAInference:
                 "region_scores": region_scores,
                 "region_names": region_names_top,
                 "grounding_boxes": grounding_boxes,
+                "heatmap_2d": heatmap_2d if "heatmap_2d" in locals() else None,
                 "counterfactual_explanation": cf_explanation,
                 "reasoning_tree": tree.get("reasoning_trace"),
             },
@@ -194,8 +193,8 @@ class PathVQAInference:
 
     def _compute_symbolic(self, outputs, questions):
         """Combine neural and symbolic logits (mirrors evaluate.py logic)."""
-        if not self.config.symbolic.enabled or "scene_region_logits" not in outputs:
-            return outputs["answer_logits"], {}
+        if not self.config.symbolic.enabled or outputs.scene_region_logits is None:
+            return outputs.answer_logits, {}
         queries = [parse_question(q, self.answer_vocab) for q in questions]
         exec_out = execute(
             scene_logits=outputs,
@@ -205,17 +204,17 @@ class PathVQAInference:
             attribute_mappings=self.attribute_mappings,
             answer_to_idx=self.answer_to_idx,
             answer_vocab_size=len(self.answer_vocab),
-            neural_logits=outputs["answer_logits"],
+            neural_logits=outputs.answer_logits,
             ontology=self.ontology,
         )
-        if self.config.symbolic.weighting_strategy == "learned" and "gate_values" in outputs:
-            gate = outputs["gate_values"].squeeze(-1)
-            symbolic_logits = exec_out["symbolic_logits"]
+        if self.config.symbolic.weighting_strategy == "learned" and outputs.gate_values is not None:
+            gate = outputs.gate_values.squeeze(-1)
+            symbolic_logits = exec_out.symbolic_logits
             gate_expanded = gate.unsqueeze(1).expand_as(symbolic_logits)
-            combined = (1 - gate_expanded) * outputs["answer_logits"] + gate_expanded * symbolic_logits
-            return combined, exec_out.get("trace", {})
-        combined = outputs["answer_logits"] + self.config.symbolic.symbolic_weight * exec_out["symbolic_logits"]
-        return combined, exec_out.get("trace", {})
+            combined = (1 - gate_expanded) * outputs.answer_logits + gate_expanded * symbolic_logits
+            return combined, exec_out.trace
+        combined = outputs.answer_logits + self.config.symbolic.symbolic_weight * exec_out.symbolic_logits
+        return combined, exec_out.trace
 
     def model_info(self) -> Dict:
         """Return checkpoint metadata."""

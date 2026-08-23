@@ -1,4 +1,4 @@
-from data.pathvqa_dataset import (
+from pathvqa.data.pathvqa_dataset import (
     normalize_text, resize_keep_aspect, lookup_answer_idx,
     cache_key, ImageCache, IMAGENET_MEAN, IMAGENET_STD,
 )

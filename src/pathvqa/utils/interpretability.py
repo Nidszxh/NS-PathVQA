@@ -241,7 +241,7 @@ def compute_failure_taxonomy(
     idx_to_answer: Dict,
 ) -> Dict:
     """Compute failure taxonomy over a dataset split."""
-    from symbolic.query_parser import parse_question
+    from pathvqa.symbolic.query_parser import parse_question
 
     failure_counts = defaultdict(int)
     failure_examples = defaultdict(list)
@@ -256,7 +256,7 @@ def compute_failure_taxonomy(
             questions = batch["questions"]
 
             outputs = model(images, input_ids, attn_mask)
-            preds = outputs["answer_logits"].argmax(dim=-1)
+            preds = outputs.answer_logits.argmax(dim=-1)
 
             for i in range(len(questions)):
                 if preds[i] != targets[i]:
@@ -265,7 +265,7 @@ def compute_failure_taxonomy(
                         "qtype": qtype,
                         "predicted": preds[i].item(),
                         "target": targets[i].item(),
-                        "scene_region_logits": outputs.get("scene_region_logits", [None])[i] if "scene_region_logits" in outputs else None,
+                        "scene_region_logits": outputs.scene_region_logits[i] if outputs.scene_region_logits is not None else None,
                     }
                     failure_type = classify_failure_type(error_sample)
                     failure_counts[failure_type] += 1
@@ -284,6 +284,70 @@ def compute_failure_taxonomy(
         "failure_ratios": {k: v / max(1, total_failures) for k, v in failure_counts.items()},
         "failure_examples": dict(failure_examples),
     }
+
+
+def render_bounding_boxes(image: "PIL.Image.Image", boxes: List[List[float]], color="red", width=3) -> "PIL.Image.Image":
+    """Draw top-k bounding boxes on the image."""
+    from PIL import ImageDraw
+    out = image.copy().convert("RGB")
+    draw = ImageDraw.Draw(out)
+    w, h = out.size
+    for box in boxes:
+        x1, y1, x2, y2 = box
+        draw.rectangle([x1 * w, y1 * h, x2 * w, y2 * h], outline=color, width=width)
+    return out
+
+
+def render_attention_heatmap(image: "PIL.Image.Image", heatmap_2d: List[List[float]], alpha=0.5) -> "PIL.Image.Image":
+    """Overlay a spatial attention heatmap on the image."""
+    from PIL import Image, ImageOps
+    h_g = len(heatmap_2d)
+    w_g = len(heatmap_2d[0]) if h_g > 0 else 0
+    flat = [val for row in heatmap_2d for val in row]
+    max_val = max(flat) if flat else 1.0
+    max_val = max_val if max_val > 0 else 1.0
+    
+    heatmap_img = Image.new("L", (w_g, h_g))
+    heatmap_img.putdata([int((val / max_val) * 255) for val in flat])
+    heatmap_img = heatmap_img.resize(image.size, Image.Resampling.BILINEAR)
+    
+    red_overlay = Image.new("RGB", image.size, (255, 0, 0))
+    mask = heatmap_img.point(lambda p: int(p * alpha))
+    out = Image.composite(red_overlay, image.convert("RGB"), mask)
+    return out
+
+
+def render_symbolic_trace(trace: Dict, size: Tuple[int, int]) -> "PIL.Image.Image":
+    """Render the symbolic trace dictionary as a text image."""
+    from PIL import Image, ImageDraw
+    out = Image.new("RGB", size, (250, 250, 250))
+    draw = ImageDraw.Draw(out)
+    y = 10
+    draw.text((10, y), f"Prediction: {trace.get('prediction', '')}", fill="black")
+    y += 20
+    draw.text((10, y), f"Confidence: {trace.get('confidence', 0.0)}", fill="black")
+    y += 20
+    for k, v in trace.get("reasoning_trace", {}).items():
+        draw.text((10, y), f"{k}:", fill="blue")
+        y += 20
+        for sub_k, sub_v in v.items():
+            draw.text((20, y), f"{sub_k}: {sub_v}", fill="black")
+            y += 20
+    return out
+
+
+def render_composite_view(image: "PIL.Image.Image", boxes: List[List[float]], heatmap_2d: List[List[float]], trace: Dict) -> "PIL.Image.Image":
+    """Create a side-by-side composite: original + boxes, heatmap, and trace."""
+    from PIL import Image
+    box_img = render_bounding_boxes(image, boxes)
+    heat_img = render_attention_heatmap(image, heatmap_2d)
+    trace_img = render_symbolic_trace(trace, size=(image.width, image.height))
+    
+    composite = Image.new("RGB", (image.width * 3, image.height))
+    composite.paste(box_img, (0, 0))
+    composite.paste(heat_img, (image.width, 0))
+    composite.paste(trace_img, (image.width * 2, 0))
+    return composite
 
 
 if __name__ == "__main__":

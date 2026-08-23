@@ -17,7 +17,7 @@ NUM_QTYPES = len(QTYPE_LIST)
 
 def encode_question_types(questions: list) -> torch.Tensor:
     """Encode question strings into one-hot qtype tensors (B, NUM_QTYPES)."""
-    from symbolic.query_parser import parse_question
+    from pathvqa.symbolic.query_parser import parse_question
     batch_size = len(questions)
     onehot = torch.zeros(batch_size, NUM_QTYPES)
     for i, q in enumerate(questions):

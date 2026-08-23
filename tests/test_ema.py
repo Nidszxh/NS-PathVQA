@@ -1,5 +1,5 @@
 import torch
-from models.ema import ModelEMA
+from pathvqa.models.ema import ModelEMA
 
 
 def test_ema_update_math():
