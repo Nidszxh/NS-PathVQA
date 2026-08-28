@@ -5,15 +5,17 @@ Architecture:
   2. Question encoder: DistilBERT + LoRA → [CLS] state (768-d)
   3. Cross-modal fusion: cross-attention transformer (question queries over patches)
   4a. Neural path: MLP over [attended ‖ question_state] → answer logits
-  4b. Symbolic path: SceneParser → Executor → symbolic logits
+  4b. Symbolic path: SceneParser → scene heads + soft routing signals
 
-Fusion modes: static additive or learned gate (N1).
+This module only *emits* the scene heads, soft qtype/target distributions, and
+(optional) gate values. Executing the symbolic program and fusing it with the
+neural logits happens downstream in ``pathvqa.symbolic.poe.SymbolicFusionEngine``.
 """
+
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
-from typing import Dict
-from pathlib import Path
 from pathvqa.models.visual.visual_encoder import CLIPViTEncoder, MultiScaleVisualEncoder
 from pathvqa.models.question.question_encoder import DistilBERTQuestionEncoder
 from pathvqa.models.protocols import VisualEncoderProtocol, QuestionEncoderProtocol, ModelOutput
@@ -28,25 +30,48 @@ from pathvqa.symbolic.diff_target_extractor import DifferentiableTargetExtractor
 class NeuroSymbolicPathVQA(nn.Module):
     """Full neuro-symbolic VQA model: neural path + optional symbolic path."""
 
-    def __init__(self, answer_vocab_size: int,
-                 num_object_features: int = 512,
-                 question_hidden_dim: int = 768,
-                 dropout: float = 0.3,
-                 symbolic_enabled: bool = True,
-                 num_regions: int = 50,
-                 visual_config: dict = None,
-                 question_config: dict = None,
-                 weighting_strategy: str = "static",
-                 attribute_mappings: dict = None,
-                 query_parser: str = "learned"):
+    def __init__(
+        self,
+        answer_vocab_size: int,
+        num_object_features: int = 512,
+        question_hidden_dim: int = 768,
+        dropout: float = 0.3,
+        symbolic_enabled: bool = True,
+        num_regions: int = 50,
+        visual_config: Optional[Dict[str, Any]] = None,
+        question_config: Optional[Dict[str, Any]] = None,
+        weighting_strategy: str = "static",
+        attribute_mappings: Optional[Dict[str, torch.Tensor]] = None,
+        query_parser: str = "learned",
+        use_multiscale: bool = False,
+        use_dsl: bool = True,
+    ):
         super().__init__()
         self.symbolic_enabled = symbolic_enabled
         self.weighting_strategy = weighting_strategy
         self.query_parser = query_parser
+        # Whether the model carries the differentiable DSL interpreter. False
+        # for legacy checkpoints that predate it (detected with
+        # ``_compat.is_pre_dsl_checkpoint``): those must be rebuilt as the
+        # architecture that saved them, or strict state-dict loading fails on
+        # the missing dsl_interpreter.* keys.
+        self.use_dsl = bool(use_dsl)
+        # Whether the encoder supports/uses the multi-scale branch. ``forward``
+        # defaults to this value so configured MultiScaleVisualEncoder models
+        # actually exercise the crop branch instead of falling back to
+        # global-only features.
+        self.use_multiscale = bool(use_multiscale)
         visual_config = visual_config or {}
         question_config = question_config or {}
 
-        self.visual_encoder: VisualEncoderProtocol = CLIPViTEncoder(**visual_config)
+        # Build the right encoder once (MultiScale wraps CLIPViTEncoder, so
+        # constructing the plain encoder first would load the HF backbone twice).
+        encoder: VisualEncoderProtocol
+        if use_multiscale:
+            encoder = MultiScaleVisualEncoder(**visual_config)
+        else:
+            encoder = CLIPViTEncoder(**visual_config)
+        self.visual_encoder = encoder
         self.question_encoder: QuestionEncoderProtocol = DistilBERTQuestionEncoder(**question_config)
         self.attention = CrossModalTransformer(
             text_dim=question_hidden_dim,
@@ -66,11 +91,12 @@ class NeuroSymbolicPathVQA(nn.Module):
                 visual_dim=num_object_features,
                 num_regions=num_regions,
             )
-            self.dsl_compiler = DSLProgramCompiler()
-            self.dsl_interpreter = DifferentiableDSLInterpreter(
-                visual_dim=num_object_features,
-                attribute_mappings=attribute_mappings,
-            )
+            if self.use_dsl:
+                self.dsl_compiler = DSLProgramCompiler()
+                self.dsl_interpreter = DifferentiableDSLInterpreter(
+                    visual_dim=num_object_features,
+                    attribute_mappings=attribute_mappings,
+                )
             if self.query_parser == "learned":
                 self.diff_qtype_classifier = DifferentiableQueryClassifier(
                     hidden_dim=question_hidden_dim, num_classes=5
@@ -90,33 +116,36 @@ class NeuroSymbolicPathVQA(nn.Module):
         self.visual_encoder.enable_gradient_checkpointing()
         self.question_encoder.enable_gradient_checkpointing()
 
-    def forward(self, images: torch.Tensor, input_ids: torch.Tensor,
-                attention_mask: torch.Tensor,
-                qtype_onehot: torch.Tensor = None,
-                use_multiscale: bool = False) -> ModelOutput:
-        """Forward pass: encode → cross-attention → neural + symbolic logits.
+    def forward(
+        self,
+        images: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        qtype_onehot: Optional[torch.Tensor] = None,
+        use_multiscale: Optional[bool] = None,
+    ) -> ModelOutput:
+        """Forward pass: encode → cross-attention → neural + symbolic signals.
 
-        Neural path: classifier([attended ‖ question_state]) → answer_logits
-        Symbolic path: SceneParser → Executor → symbolic_logits (if enabled)
+        Emits ``answer_logits`` plus the symbolic heads/gate; fusion happens
+        downstream in ``pathvqa.symbolic.poe``. ``use_multiscale`` defaults to the
+        value the model was built with, so a multi-scale model exercises its crop
+        branch without every caller passing the flag.
         """
+        if use_multiscale is None:
+            use_multiscale = self.use_multiscale
         visual = self.visual_encoder(images, use_multiscale=use_multiscale)
         q = self.question_encoder(input_ids, attention_mask)
         q_state = q.question_state
         attended, attn_weights = self.attention(q_state, visual.features, visual.mask)
-        fused = torch.cat([attended, q_state], dim=-1)        # (B, visual_dim + question_hidden_dim)
-        answer_logits = self.classifier(fused)                 # (B, answer_vocab_size)
+        fused = torch.cat([attended, q_state], dim=-1)  # (B, visual_dim + question_hidden_dim)
+        answer_logits = self.classifier(fused)  # (B, answer_vocab_size)
 
         result = ModelOutput(
             answer_logits=answer_logits,
             patch_features=visual.features,
             attention_weights=attn_weights,
-            attended_features=attended
+            attended_features=attended,
         )
-        # Note: attended_features was returned previously but unused except as intermediate.
-        # We can still add it if needed, but keeping it off for now or we could add it to ModelOutput.
-        # Actually I didn't add attended_features to ModelOutput. Let's add it in another replacement if needed, 
-        # but downstream didn't grep it. Wait, `tests/test_integration.py` or others might assert it. 
-        # I'll just leave it out, or let me add it. I'll add `attended_features` to ModelOutput just in case.
 
         if self.symbolic_enabled:
             scene = self.scene_parser(attended)
@@ -125,36 +154,39 @@ class NeuroSymbolicPathVQA(nn.Module):
             result.scene_color_logits = scene.color_logits
             result.scene_shape_logits = scene.shape_logits
             result.scene_size_logits = scene.size_logits
-            result.scene_density_logits = scene.density_logits
 
             if self.query_parser == "learned":
-                # Get raw logits for training, soft probabilities for reasoning
+                # Raw logits for the warm-up CE loss; softmax probabilities for
+                # soft routing through the differentiable executor.
                 qtype_logits = self.diff_qtype_classifier(q_state, return_probs=False)
                 soft_qtype = torch.softmax(qtype_logits, dim=-1)
-                # target_logits and qtype_logits were not in ModelOutput, but let's ignore them or add if needed
-                # I'll just set the ones that exist.
                 result.soft_qtype = soft_qtype
                 result.qtype_logits = qtype_logits
-                
+
                 target_logits = self.diff_target_extractor(q_state, return_probs=False)
                 soft_target = torch.softmax(target_logits, dim=-1)
                 result.soft_target = soft_target
                 result.target_logits = target_logits
 
             if self.weighting_strategy == "learned":
-                # If learned query parser is enabled, use soft_qtype instead of hard qtype_onehot
+                # Soft routing (learned parser) feeds the gate directly; the
+                # regex path falls back to the caller's one-hot qtype.
                 gate_qtype = soft_qtype if self.query_parser == "learned" else qtype_onehot
                 if gate_qtype is not None:
-                    # Scene score: max object-presence sigmoid across regions → (B, 1)
-                    c_scene = torch.sigmoid(scene.object_presence).max(dim=1, keepdim=True).values
+                    # c_scene: max object-presence over regions → (B, 1).
+                    # object_presence is already sigmoid-activated by the scene
+                    # parser; a second sigmoid would compress it to [0.5, 0.73].
+                    c_scene = scene.object_presence.max(dim=1, keepdim=True).values
                     gate = self.gate(attended, c_scene, gate_qtype, attn_weights)
                     result.gate_values = gate
 
         return result
 
 
-def build_model(config, answer_vocab_size, attribute_mappings=None):
-    """Create NeuroSymbolicPathVQA from a Config object."""
+def build_model(
+    config: Any, answer_vocab_size: int, attribute_mappings: Optional[Dict[str, torch.Tensor]] = None
+) -> "NeuroSymbolicPathVQA":
+    """Construct an untrained model from a ``Config``, wiring every encoder/symbolic option."""
     visual_kwargs = dict(
         model_name=config.visual.model_name,
         num_object_features=config.visual.num_object_features,
@@ -180,11 +212,14 @@ def build_model(config, answer_vocab_size, attribute_mappings=None):
         question_config=question_kwargs,
         weighting_strategy=config.symbolic.weighting_strategy,
         attribute_mappings=attribute_mappings,
-        query_parser=getattr(config.symbolic, "query_parser", "regex" if not getattr(config.symbolic, "differentiable_pipeline", False) else "learned"),
+        query_parser=getattr(
+            config.symbolic,
+            "query_parser",
+            "regex" if not getattr(config.symbolic, "differentiable_pipeline", False) else "learned",
+        ),
+        use_multiscale=getattr(config.visual, "use_multiscale", False),
+        use_dsl=getattr(config.symbolic, "dsl_enabled", True),
     )
-    # Replace visual encoder with MultiScaleVisualEncoder if configured
-    if getattr(config.visual, "use_multiscale", False):
-        model.visual_encoder = MultiScaleVisualEncoder(**visual_kwargs)
     return model
 
 
@@ -209,7 +244,9 @@ if __name__ == "__main__":
 
     print("Testing with learned gate (entropy wired)...")
     model3 = NeuroSymbolicPathVQA(
-        answer_vocab_size=50, symbolic_enabled=True, num_regions=10,
+        answer_vocab_size=50,
+        symbolic_enabled=True,
+        num_regions=10,
         weighting_strategy="learned",
     )
     qtype_oh = torch.zeros(2, 5)

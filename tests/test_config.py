@@ -1,8 +1,15 @@
+"""Config defaults, validation, debug isolation, and legacy-checkpoint backfill."""
+
 from pathlib import Path
 import pytest
 from pathvqa.utils.config import (
-    Config, SymbolicConfig, get_debug_config, get_default_config, PathConfig,
-    backfill_config, validate_config,
+    Config,
+    SymbolicConfig,
+    get_debug_config,
+    get_default_config,
+    PathConfig,
+    backfill_config,
+    validate_config,
 )
 
 
@@ -52,14 +59,20 @@ def test_validate_config_accepts_defaults():
     validate_config(get_default_config())
 
 
-@pytest.mark.parametrize("mutate, match", [
-    (lambda c: setattr(c.visual, "backbone", "resnet50"), "Unknown visual backbone"),
-    (lambda c: setattr(c.question, "encoder", "bloom"), "Unknown question encoder"),
-    (lambda c: setattr(c.training, "optimizer", "rmsprop"), "Unknown optimizer"),
-    (lambda c: setattr(c.training, "scheduler", "warmup"), "Unknown scheduler"),
-    (lambda c: setattr(c.training, "grad_accum_steps", 0), "grad_accum_steps"),
-    (lambda c: setattr(c.training, "ema_decay", 1.0), "ema_decay"),
-])
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        (lambda c: setattr(c.visual, "backbone", "resnet50"), "Unknown visual backbone"),
+        (lambda c: setattr(c.question, "encoder", "bloom"), "Unknown question encoder"),
+        (lambda c: setattr(c.training, "optimizer", "rmsprop"), "Unknown optimizer"),
+        (lambda c: setattr(c.training, "scheduler", "warmup"), "Unknown scheduler"),
+        (lambda c: setattr(c.training, "grad_accum_steps", 0), "grad_accum_steps"),
+        (lambda c: setattr(c.training, "ema_decay", 1.0), "ema_decay"),
+        (lambda c: setattr(c.symbolic, "query_parser", "llm"), "Unknown query parser"),
+        (lambda c: setattr(c.symbolic, "executor", "neural"), "Unknown executor"),
+        (lambda c: setattr(c.symbolic, "weighting_strategy", "sum"), "Unknown weighting strategy"),
+    ],
+)
 def test_validate_config_rejects_invalid(mutate, match):
     cfg = get_default_config()
     mutate(cfg)
@@ -88,12 +101,25 @@ def test_debug_never_touches_real_checkpoints():
 
 
 def test_debug_skips_baseline_artifact():
-    cfg = get_debug_config()
-    assert cfg.debug is True
+    """A --debug run must not emit ``outputs/<experiment>.json``.
+
+    Exercises the real ``Trainer._should_write_baseline`` predicate rather than
+    merely asserting the debug flag. The Trainer is constructed with
+    ``__new__`` so no dataset/model is built.
+    """
+    from train import Trainer
+
+    trainer = Trainer.__new__(Trainer)
+
+    trainer.config = get_debug_config()
+    assert trainer._should_write_baseline() is False
+
+    trainer.config = get_default_config()
+    assert trainer._should_write_baseline() is True
 
 
 def test_backfill_config_adds_missing_fields():
-    """Simulate an old checkpoint config (pre-Phase-2: no use_cache/norm)."""
+    """Simulate an old checkpoint config that predates use_cache/norm/randaugment."""
     cfg = get_default_config()
     delattr(cfg.data, "use_cache")
     delattr(cfg.data, "norm")
@@ -103,6 +129,55 @@ def test_backfill_config_adds_missing_fields():
     assert cfg.data.norm == "clip"
     assert cfg.data.use_randaugment is True
     assert cfg.paths.cache_dir == Path("data/cache")
+
+
+def test_backfill_legacy_differentiable_marker_wins():
+    """Regression: a legacy differentiable-pipeline config must keep learned.
+
+    Old checkpoints predate the explicit ``query_parser``/``executor`` fields
+    and marked the differentiable pipeline with a single
+    ``differentiable_pipeline`` bool. The migration previously deleted the
+    marker before falling through to the "default to regex/hard" branch, so a
+    trained differentiable checkpoint loaded without its modules.
+    """
+    cfg = get_default_config()
+    delattr(cfg.symbolic, "query_parser")
+    delattr(cfg.symbolic, "executor")
+    cfg.symbolic.differentiable_pipeline = True
+    backfill_config(cfg)
+    assert cfg.symbolic.query_parser == "learned"
+    assert cfg.symbolic.executor == "differentiable"
+    assert not hasattr(cfg.symbolic, "differentiable_pipeline")
+
+
+def test_backfill_legacy_without_marker_defaults_to_regex_hard():
+    """A pre-marker checkpoint was trained regex/hard; do not attach new modules."""
+    cfg = get_default_config()
+    delattr(cfg.symbolic, "query_parser")
+    delattr(cfg.symbolic, "executor")
+    backfill_config(cfg)
+    assert cfg.symbolic.query_parser == "regex"
+    assert cfg.symbolic.executor == "hard"
+
+
+def test_backfill_preserves_explicit_symbolic_fields():
+    """Explicit parser/executor choices must survive a backfill untouched."""
+    cfg = get_default_config()
+    cfg.symbolic.query_parser = "regex"
+    cfg.symbolic.executor = "differentiable"
+    backfill_config(cfg)
+    assert cfg.symbolic.query_parser == "regex"
+    assert cfg.symbolic.executor == "differentiable"
+
+
+def test_backfill_adds_new_training_and_symbolic_fields():
+    """New fields (deterministic, qtype_warmup_weight) backfill to defaults."""
+    cfg = get_default_config()
+    delattr(cfg.training, "deterministic")
+    delattr(cfg.symbolic, "qtype_warmup_weight")
+    backfill_config(cfg)
+    assert cfg.training.deterministic is False
+    assert cfg.symbolic.qtype_warmup_weight == 0.1
 
 
 def test_lora_target_modules_normalized_from_list():
@@ -138,6 +213,6 @@ def test_config_ignores_unknown_fields(tmp_path):
     with open(path) as f:
         content = f.read()
     with open(path, "w") as f:
-        f.write(content.replace("}", ", \"unknown_field\": 42}", 1))
+        f.write(content.replace("}", ', "unknown_field": 42}', 1))
     loaded = Config.load(path)
     assert not hasattr(loaded, "unknown_field")

@@ -1,13 +1,14 @@
 """Hierarchical dataclass configuration with validation for NS-PathVQA."""
 
 from dataclasses import dataclass, field
-from typing import Tuple, Optional
+from typing import Any, Tuple, Optional
 from pathlib import Path
 
 
 @dataclass
 class DataConfig:
     """Data loading parameters."""
+
     image_size: Tuple[int, int] = (224, 224)
     batch_size: int = 32
     num_workers: int = 6
@@ -23,16 +24,17 @@ class DataConfig:
 @dataclass
 class VisualConfig:
     """Visual encoder (CLIP ViT-B/32 or PLIP frozen + LoRA) parameters."""
+
     backbone: str = "plip"
     model_name: str = "vinid/plip"
     num_object_features: int = 512
     num_objects: int = 49
     lora_rank: int = 16
     lora_alpha: int = 32
-    lora_target_modules: tuple = ("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2")
+    lora_target_modules: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2")
     use_multiscale: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if isinstance(self.lora_target_modules, list):
             self.lora_target_modules = tuple(self.lora_target_modules)
         if self.backbone == "clip_vit_b_32" and self.model_name == "vinid/plip":
@@ -44,16 +46,17 @@ class VisualConfig:
 @dataclass
 class QuestionConfig:
     """Question encoder (DistilBERT frozen + LoRA) parameters."""
+
     encoder: str = "distilbert"
     model_name: str = "distilbert-base-uncased"
     hidden_dim: int = 768
     max_seq_len: int = 64
     lora_rank: int = 16
     lora_alpha: int = 32
-    lora_target_modules: tuple = ("q_lin", "k_lin", "v_lin", "out_lin")
+    lora_target_modules: Tuple[str, ...] = ("q_lin", "k_lin", "v_lin", "out_lin")
     dropout: float = 0.3
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if isinstance(self.lora_target_modules, list):
             self.lora_target_modules = tuple(self.lora_target_modules)
 
@@ -61,6 +64,7 @@ class QuestionConfig:
 @dataclass
 class TrainingConfig:
     """Optimization and training loop parameters."""
+
     num_epochs: int = 50
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
@@ -82,6 +86,9 @@ class TrainingConfig:
     max_checkpoints: int = 3
     device: str = "cuda"
     use_amp: bool = True
+    # When True, training forces deterministic cuDNN kernels and disables
+    # cudnn.benchmark so runs are bit-reproducible (slower). See set_seed().
+    deterministic: bool = False
 
 
 @dataclass
@@ -91,9 +98,10 @@ class SymbolicConfig:
     SceneParser predicts regions, object presence, and attribute logits.
     Executor maps these to answer vocab logits per parsed question type.
     """
+
     enabled: bool = True
     num_regions: int = 50
-    region_names: tuple = ()
+    region_names: Tuple[str, ...] = ()
     symbolic_weight: float = 0.3
     weighting_strategy: str = "static"  # "static" or "learned"
     ltn_enabled: bool = True
@@ -107,9 +115,17 @@ class SymbolicConfig:
     ontology_path: Optional[str] = None
     query_parser: str = "learned"  # "regex" or "learned"
     executor: str = "differentiable"  # "hard" or "differentiable"
+    # Whether the model carries the differentiable DSL interpreter. Loaders flip
+    # this to False for checkpoints that predate the interpreter (detected from
+    # the state dict via pathvqa._compat.is_pre_dsl_checkpoint) so the model is
+    # rebuilt as the architecture that produced them instead of failing
+    # strict=True on missing dsl_interpreter.* params.
+    dsl_enabled: bool = True
     qtype_warmup_epochs: int = 3
+    # Cross-entropy weight applied to the learned qtype classifier during warmup.
+    qtype_warmup_weight: float = 0.1
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if isinstance(self.region_names, list):
             self.region_names = tuple(self.region_names)
         if self.weighting_strategy not in ("static", "learned"):
@@ -119,6 +135,7 @@ class SymbolicConfig:
 @dataclass
 class PathConfig:
     """Filesystem paths for data, checkpoints, logs, and outputs."""
+
     root_dir: Path = field(default_factory=lambda: Path("."))
     data_dir: Path = field(default_factory=lambda: Path("data/pathvqa"))
     cache_dir: Path = field(default_factory=lambda: Path("data/cache"))
@@ -127,7 +144,7 @@ class PathConfig:
     output_dir: Path = field(default_factory=lambda: Path("outputs"))
     best_model_path: Path = field(default_factory=lambda: Path("checkpoints/best_model.pt"))
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         for path in [self.checkpoint_dir, self.log_dir, self.output_dir, self.cache_dir]:
             path.mkdir(parents=True, exist_ok=True)
 
@@ -135,6 +152,7 @@ class PathConfig:
 @dataclass
 class Config:
     """Root configuration aggregating all sub-configs."""
+
     experiment_name: str = "pathvqa_neuro_symbolic"
     seed: int = 42
     debug: bool = False
@@ -145,12 +163,12 @@ class Config:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     paths: PathConfig = field(default_factory=PathConfig)
 
-    def save(self, path: str):
+    def save(self, path: str) -> None:
         """Serialize config to JSON (Path objects converted to strings)."""
         import json
         from dataclasses import asdict
 
-        def convert(obj):
+        def convert(obj: Any) -> Any:
             if isinstance(obj, dict):
                 return {k: convert(v) for k, v in obj.items()}
             elif isinstance(obj, Path):
@@ -159,26 +177,29 @@ class Config:
                 return [convert(i) for i in obj]
             return obj
 
-        with open(path, 'w') as f:
+        with open(path, "w") as f:
             json.dump(convert(asdict(self)), f, indent=2)
         print(f"Configuration saved to {path}")
 
     @classmethod
-    def load(cls, path: str):
+    def load(cls, path: str) -> "Config":
         """Deserialize config from JSON, restoring Path fields."""
         import json
+
         with open(path) as f:
             d = json.load(f)
         config = cls()
         for key, value in d.items():
-            if key in ['data', 'visual', 'question', 'symbolic', 'training', 'paths']:
+            if key in ["data", "visual", "question", "symbolic", "training", "paths"]:
                 sub = getattr(config, key)
                 for sk, sv in value.items():
                     if hasattr(sub, sk):
-                        if ('path' in sk.lower() or 'dir' in sk.lower()) and sv is not None:
+                        if ("path" in sk.lower() or "dir" in sk.lower()) and sv is not None:
                             sv = Path(sv)
+                        elif sk == "image_size" and isinstance(sv, list):
+                            sv = tuple(sv)  # JSON round-trips tuples as lists
                         setattr(sub, sk, sv)
-                if hasattr(sub, '__post_init__'):
+                if hasattr(sub, "__post_init__"):
                     sub.__post_init__()
             else:
                 if hasattr(config, key):
@@ -207,6 +228,12 @@ def validate_config(cfg: Config) -> None:
         raise ValueError(f"ema_decay must be in [0, 1), got {cfg.training.ema_decay}")
     if cfg.symbolic.enabled and cfg.symbolic.symbolic_weight < 0:
         raise ValueError(f"symbolic_weight must be >= 0, got {cfg.symbolic.symbolic_weight}")
+    if cfg.symbolic.query_parser not in ("regex", "learned"):
+        raise ValueError(f"Unknown query parser: {cfg.symbolic.query_parser!r}")
+    if cfg.symbolic.executor not in ("hard", "differentiable"):
+        raise ValueError(f"Unknown executor: {cfg.symbolic.executor!r}")
+    if cfg.symbolic.weighting_strategy not in ("static", "learned"):
+        raise ValueError(f"Unknown weighting strategy: {cfg.symbolic.weighting_strategy!r}")
 
 
 def backfill_config(cfg: Config) -> Config:
@@ -217,28 +244,43 @@ def backfill_config(cfg: Config) -> Config:
     stay loadable.
     """
     from dataclasses import fields
+
     for sub_name in ("data", "visual", "question", "symbolic", "training", "paths"):
         sub = getattr(cfg, sub_name, None)
         default_sub = getattr(Config(), sub_name)
         if sub is None:
             setattr(cfg, sub_name, default_sub)
             continue
-        missing = [f.name for f in fields(default_sub) if not hasattr(sub, f.name)]
+        # Detect fields absent from the *instance* state. ``hasattr`` alone is
+        # wrong for dataclasses: a field an old pickle never stored still
+        # resolves to the class-level default, hiding it from migration.
+        state = getattr(sub, "__dict__", None)
+        if state is not None:
+            missing = [f.name for f in fields(default_sub) if f.name not in state]
+        else:
+            missing = [f.name for f in fields(default_sub) if not hasattr(sub, f.name)]
         for name in missing:
             setattr(sub, name, getattr(default_sub, name))
         if hasattr(sub, "__post_init__"):
             sub.__post_init__()
-        
-        # Backward compatibility for Phase A-D transition
-        if sub_name == "symbolic" and hasattr(sub, "differentiable_pipeline"):
-            if getattr(sub, "differentiable_pipeline"):
-                sub.query_parser = "learned"
-                sub.executor = "differentiable"
-            else:
-                sub.query_parser = "regex"
-                sub.executor = "hard"
+
+        # Capture the legacy marker BEFORE deleting it, so the fallback below
+        # cannot clobber the query_parser/executor it translates.
+        had_differentiable_marker = sub_name == "symbolic" and hasattr(sub, "differentiable_pipeline")
+
+        if had_differentiable_marker:
+            legacy_diff = bool(getattr(sub, "differentiable_pipeline"))
+            sub.query_parser = "learned" if legacy_diff else "regex"
+            sub.executor = "differentiable" if legacy_diff else "hard"
             delattr(sub, "differentiable_pipeline")
-            
+
+        # Checkpoints predating both the explicit fields and the marker were
+        # trained regex/hard; defaulting them to learned/differentiable would
+        # attach freshly initialized modules whose weights they lack.
+        elif sub_name == "symbolic" and ("query_parser" in missing or "executor" in missing):
+            sub.query_parser = "regex"
+            sub.executor = "hard"
+
     return cfg
 
 
@@ -263,7 +305,8 @@ def get_debug_config() -> Config:
 if __name__ == "__main__":
     import json
     from dataclasses import asdict
-    def convert(obj):
+
+    def convert(obj: Any) -> Any:
         if isinstance(obj, dict):
             return {k: convert(v) for k, v in obj.items()}
         elif isinstance(obj, Path):
@@ -271,11 +314,14 @@ if __name__ == "__main__":
         elif isinstance(obj, list):
             return [convert(i) for i in obj]
         return obj
+
     cfg = get_default_config()
     print(f"Experiment: {cfg.experiment_name}")
     print(f"Default config: {json.dumps(convert(asdict(cfg)), indent=2)}")
     print(f"Symbolic enabled: {cfg.symbolic.enabled}, regions: {cfg.symbolic.num_regions}")
     dbg = get_debug_config()
-    print(f"Debug config: max_train={dbg.data.max_train_samples}, "
-          f"batch={dbg.data.batch_size}, epochs={dbg.training.num_epochs}")
+    print(
+        f"Debug config: max_train={dbg.data.max_train_samples}, "
+        f"batch={dbg.data.batch_size}, epochs={dbg.training.num_epochs}"
+    )
     print("Config test passed!")

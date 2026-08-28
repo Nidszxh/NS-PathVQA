@@ -1,148 +1,251 @@
+"""Publication figures from *real* evaluation artifacts.
+
+Every figure is derived from fields actually present in an ``evaluate.py``
+output JSON. Nothing is fabricated: if a required field is missing the figure
+is skipped with a message rather than filled with synthetic numbers.
+
+Use ``--mock`` only to smoke-test the plotting pipeline; mock figures are
+watermarked and must never be used as empirical evidence.
+"""
+
 import argparse
 import json
-import os
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import matplotlib.pyplot as plt
 import numpy as np
 
+
 def setup_style():
     """Setup matplotlib style for publication-ready figures."""
-    plt.style.use('ggplot')
-    plt.rcParams.update({
-        "font.family": "serif",
-        "font.size": 12,
-        "axes.labelsize": 14,
-        "axes.titlesize": 16,
-        "legend.fontsize": 12,
-        "xtick.labelsize": 11,
-        "ytick.labelsize": 11,
-        "figure.dpi": 300,
-        "savefig.dpi": 300,
-        "savefig.bbox": "tight"
-    })
+    plt.style.use("ggplot")
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.size": 12,
+            "axes.labelsize": 14,
+            "axes.titlesize": 16,
+            "legend.fontsize": 12,
+            "xtick.labelsize": 11,
+            "ytick.labelsize": 11,
+            "figure.dpi": 300,
+            "savefig.dpi": 300,
+            "savefig.bbox": "tight",
+        }
+    )
 
-def generate_mock_data():
-    """Generates synthetic data mirroring the expected evaluation outputs."""
+
+def generate_mock_data() -> Dict[str, Any]:
+    """Synthetic data with the same shape as a real eval artifact (--mock only)."""
     return {
-        "qtype_heatmap": {
-            "matrix": np.array([
-                [0.92, 0.02, 0.01, 0.04, 0.01],
-                [0.05, 0.88, 0.03, 0.02, 0.02],
-                [0.01, 0.04, 0.95, 0.00, 0.00],
-                [0.10, 0.05, 0.02, 0.80, 0.03],
-                [0.02, 0.02, 0.01, 0.00, 0.95]
-            ]),
-            "labels": ["Identity", "Location", "Yes/No", "Attribute", "Count"]
+        "accuracy": 82.4,
+        "qtype_confusion": {
+            "matrix": [
+                [92, 2, 1, 4, 1],
+                [5, 88, 3, 2, 2],
+                [1, 4, 95, 0, 0],
+                [10, 5, 2, 80, 3],
+                [2, 2, 1, 0, 95],
+            ],
+            "labels": ["identity", "location", "yes_no", "attribute", "count"],
         },
-        "concept_attribution": {
-            "concepts": ["nucleus", "stroma", "lymphocyte", "gland", "mass", "necrosis", "mitosis"],
-            "attribution_scores": [0.35, 0.15, 0.20, 0.12, 0.10, 0.05, 0.03]
+        "per_type_accuracy": {
+            "identity": {"accuracy": 92.0, "correct": 92, "total": 100},
+            "location": {"accuracy": 88.0, "correct": 88, "total": 100},
+            "yes_no": {"accuracy": 95.0, "correct": 95, "total": 100},
+            "attribute": {"accuracy": 80.0, "correct": 80, "total": 100},
+            "count": {"accuracy": 95.0, "correct": 95, "total": 100},
         },
-        "intervention_delta": {
-            "qtypes": ["Identity", "Location", "Yes/No", "Attribute", "Count"],
-            "deltas": [4.2, 5.8, 2.1, 6.4, 3.5]
+        "calibration": {
+            "ece": 0.04,
+            "temperature": 1.1,
+            "reliability_bins": [
+                {
+                    "bin_lower": i / 10,
+                    "bin_upper": (i + 1) / 10,
+                    "accuracy": min(1.0, i / 10 + 0.05),
+                    "confidence": i / 10 + 0.03,
+                    "count": 100,
+                }
+                for i in range(10)
+            ],
         },
         "failure_taxonomy": {
-            "categories": ["Visual Perception", "Query Parsing", "Symbolic Execution", "Ambiguous Ground Truth"],
-            "percentages": [45, 15, 25, 15]
+            "failure_counts": {"perception": 45, "parsing": 15, "execution": 25},
         },
-        "efficiency_scatter": {
-            "models": ["Neuro-Symbolic PathVQA", "LLaVA-Med", "Med-Flamingo", "PathVQA-Base"],
-            "accuracy": [82.4, 84.1, 85.5, 76.2],
-            "parameters_b": [0.15, 7.0, 9.0, 0.11]  # In billions
-        }
+        "concept_interventions": {"probe_accuracy_delta": 4.2},
     }
 
-def plot_qtype_heatmap(data, out_dir):
-    """Figure 2: Soft qtype distribution heatmap."""
+
+def _annotate_mock(fig) -> None:
+    fig.text(0.5, 0.01, "SYNTHETIC (--mock) — NOT EMPIRICAL EVIDENCE", ha="center", color="red", fontsize=10)
+
+
+def plot_qtype_heatmap(eval_data: Dict[str, Any], out_dir: Path, mock: bool) -> bool:
+    """Row-normalized q-type confusion matrix (soft classifier vs regex labels)."""
+    conf = eval_data.get("qtype_confusion")
+    if not conf:
+        return False
+    matrix = np.asarray(conf["matrix"], dtype=float)
+    labels = conf.get("labels", [str(i) for i in range(matrix.shape[0])])
+    row_sums = matrix.sum(axis=1, keepdims=True)
+    norm = np.divide(matrix, row_sums, out=np.zeros_like(matrix), where=row_sums > 0)
+
     fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(data["matrix"], cmap="Blues")
+    im = ax.imshow(norm, cmap="Blues", vmin=0, vmax=1)
     plt.colorbar(im, ax=ax)
-    
-    ax.set_xticks(np.arange(len(data["labels"])))
-    ax.set_yticks(np.arange(len(data["labels"])))
-    ax.set_xticklabels(data["labels"])
-    ax.set_yticklabels(data["labels"])
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+    ax.set_xticklabels(labels)
+    ax.set_yticklabels(labels)
     plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-    
-    for i in range(len(data["labels"])):
-        for j in range(len(data["labels"])):
-            ax.text(j, i, f"{data['matrix'][i, j]:.2f}", ha="center", va="center", 
-                    color="white" if data["matrix"][i, j] > 0.5 else "black")
-                    
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            ax.text(
+                j,
+                i,
+                f"{norm[i, j]:.2f}",
+                ha="center",
+                va="center",
+                color="white" if norm[i, j] > 0.5 else "black",
+            )
     ax.set_title("Differentiable Query Classifier Confusion")
     ax.set_xlabel("Predicted Soft Q-Type")
     ax.set_ylabel("True Regex Q-Type")
+    if mock:
+        _annotate_mock(fig)
     fig.savefig(out_dir / "fig2_qtype_heatmap.png")
     plt.close(fig)
+    return True
 
-def plot_concept_attribution(data, out_dir):
-    """Figure 3: Concept attribution bar chart."""
+
+def plot_per_type_accuracy(eval_data: Dict[str, Any], out_dir: Path, mock: bool) -> bool:
+    """Per-question-type accuracy from the evaluation split."""
+    per_type = eval_data.get("per_type_accuracy")
+    if not per_type:
+        return False
+    qtypes = sorted(per_type)
+    accs = [per_type[q]["accuracy"] for q in qtypes]
+
     fig, ax = plt.subplots(figsize=(8, 4))
-    x_pos = np.arange(len(data["concepts"]))
-    ax.bar(x_pos, data["attribution_scores"], color=plt.cm.viridis(np.linspace(0, 1, len(data["concepts"]))))
+    x_pos = np.arange(len(qtypes))
+    ax.bar(x_pos, accs, color=plt.cm.viridis(np.linspace(0, 1, len(qtypes))))
     ax.set_xticks(x_pos)
-    ax.set_xticklabels(data["concepts"], rotation=45)
-    ax.set_title("Average Concept Attribution Saliency")
-    ax.set_ylabel("Normalized Attribution Score")
-    ax.set_xlabel("Scene Concepts (Regions)")
-    fig.savefig(out_dir / "fig3_concept_attribution.png")
-    plt.close(fig)
-
-def plot_intervention_delta(data, out_dir):
-    """Figure 4: Intervention accuracy delta per question type."""
-    fig, ax = plt.subplots(figsize=(7, 4))
-    x_pos = np.arange(len(data["qtypes"]))
-    bars = ax.bar(x_pos, data["deltas"], color=plt.cm.magma(np.linspace(0.2, 0.8, len(data["qtypes"]))))
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(data["qtypes"])
-    ax.set_title("Accuracy Recovery via Concept Interventions")
-    ax.set_ylabel("Accuracy Delta (%)")
+    ax.set_xticklabels(qtypes, rotation=45)
+    ax.set_ylim(0, 100)
+    ax.set_title("Per-Question-Type Accuracy")
+    ax.set_ylabel("Accuracy (%)")
     ax.set_xlabel("Question Type")
-    
-    for bar in bars:
-        height = bar.get_height()
-        ax.annotate(f'+{height}%', xy=(bar.get_x() + bar.get_width() / 2, height),
-                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontweight='bold')
-                    
+    if mock:
+        _annotate_mock(fig)
+    fig.savefig(out_dir / "fig3_per_type_accuracy.png")
+    plt.close(fig)
+    return True
+
+
+def plot_intervention_delta(eval_data: Dict[str, Any], out_dir: Path, mock: bool) -> bool:
+    """Accuracy delta from concept-probe interventions (real runs only)."""
+    interventions = eval_data.get("concept_interventions")
+    if not interventions or "probe_accuracy_delta" not in interventions:
+        return False
+    delta = float(interventions["probe_accuracy_delta"])
+
+    fig, ax = plt.subplots(figsize=(5, 4))
+    bar = ax.bar(["Concept probe"], [delta], color="#4c72b0")
+    ax.axhline(0.0, color="black", linewidth=0.8)
+    ax.set_ylabel("Accuracy Delta (%)")
+    ax.set_title("Accuracy Recovery via Concept Interventions")
+    ax.annotate(
+        f"{delta:+.2f}%",
+        xy=(bar[0].get_x() + bar[0].get_width() / 2, delta),
+        xytext=(0, 3 if delta >= 0 else -12),
+        textcoords="offset points",
+        ha="center",
+        fontweight="bold",
+    )
+    if mock:
+        _annotate_mock(fig)
     fig.savefig(out_dir / "fig4_intervention_delta.png")
     plt.close(fig)
+    return True
 
-def plot_failure_taxonomy(data, out_dir):
-    """Figure 5: Failure taxonomy breakdown pie chart."""
+
+def plot_failure_taxonomy(eval_data: Dict[str, Any], out_dir: Path, mock: bool) -> bool:
+    """Failure-taxonomy breakdown from measured failure counts."""
+    tax = eval_data.get("failure_taxonomy")
+    if not tax:
+        return False
+    counts = tax.get("failure_counts") or {}
+    counts = {k: v for k, v in counts.items() if v > 0}
+    if not counts:
+        return False
+
     fig, ax = plt.subplots(figsize=(6, 6))
-    colors = plt.cm.Pastel1(np.linspace(0, 1, len(data["categories"])))
-    ax.pie(data["percentages"], labels=data["categories"], colors=colors, autopct='%.1f%%',
-           startangle=140, wedgeprops={'edgecolor': 'white'})
-    ax.set_title("Error Taxonomy Breakdown (C7)")
+    labels = list(counts)
+    values = [counts[k] for k in labels]
+    colors = plt.cm.Pastel1(np.linspace(0, 1, len(labels)))
+    ax.pie(values, labels=labels, colors=colors, autopct="%.1f%%", startangle=140, wedgeprops={"edgecolor": "white"})
+    ax.set_title("Error Taxonomy Breakdown")
+    if mock:
+        _annotate_mock(fig)
     fig.savefig(out_dir / "fig5_failure_taxonomy.png")
     plt.close(fig)
+    return True
 
-def plot_efficiency_scatter(data, out_dir):
-    """Figure 6: Efficiency scatter plot."""
-    fig, ax = plt.subplots(figsize=(7, 5))
-    
-    markers = ["*", "o", "s", "X"]
-    colors = plt.cm.tab10(np.linspace(0, 1, len(data["models"])))
-    
-    for i, model in enumerate(data["models"]):
-        ax.scatter(data["parameters_b"][i], data["accuracy"][i], s=150, 
-                   label=model, marker=markers[i], color=colors[i])
-                    
-    ax.set_xscale("log")
-    ax.set_title("Pareto Trade-off: Accuracy vs. Model Size")
-    ax.set_xlabel("Parameters (Billions) - Log Scale")
-    ax.set_ylabel("Validation Accuracy (%)")
-    ax.grid(True, which="both", ls="--", alpha=0.5)
-    
-    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    fig.savefig(out_dir / "fig6_efficiency_scatter.png", bbox_inches='tight')
+
+def plot_calibration(eval_data: Dict[str, Any], out_dir: Path, mock: bool) -> bool:
+    """Reliability diagram from measured calibration bins."""
+    calib = eval_data.get("calibration")
+    bins: Optional[List[Dict[str, Any]]] = calib.get("reliability_bins") if calib else None
+    if not bins:
+        return False
+    conf = [b["confidence"] for b in bins if b.get("count", 0) > 0]
+    acc = [b["accuracy"] for b in bins if b.get("count", 0) > 0]
+    if not conf:
+        return False
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.plot([0, 1], [0, 1], linestyle="--", color="grey", label="Perfect calibration")
+    ax.plot(conf, acc, marker="o", color="#c44e52", label="Model")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ece = calib.get("ece")
+    title = "Calibration Reliability Diagram" + (f" (ECE={ece:.3f})" if ece is not None else "")
+    ax.set_title(title)
+    ax.set_xlabel("Confidence")
+    ax.set_ylabel("Accuracy")
+    ax.legend(loc="upper left")
+    if mock:
+        _annotate_mock(fig)
+    fig.savefig(out_dir / "fig6_calibration.png")
     plt.close(fig)
+    return True
+
+
+PLOTTERS = [
+    plot_qtype_heatmap,
+    plot_per_type_accuracy,
+    plot_intervention_delta,
+    plot_failure_taxonomy,
+    plot_calibration,
+]
+
+
+def load_eval_data(eval_path: str) -> Dict[str, Any]:
+    """Load a real evaluation artifact."""
+    with open(eval_path) as f:
+        return json.load(f)
+
 
 def main():
     parser = argparse.ArgumentParser(description="Generate paper figures for Neuro-Symbolic PathVQA.")
-    parser.add_argument("--eval-results", type=str, help="Path to actual eval_results.json")
-    parser.add_argument("--mock", action="store_true", help="Generate synthetic data (useful before full intervention runs)")
+    parser.add_argument("--eval-results", type=str, help="Path to an evaluate.py output JSON (required unless --mock)")
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="Generate clearly-watermarked synthetic figures to smoke-test plotting (never empirical)",
+    )
     parser.add_argument("--out-dir", type=str, default="outputs/figures", help="Directory to save output figures")
     args = parser.parse_args()
 
@@ -151,25 +254,24 @@ def main():
     setup_style()
 
     if args.mock:
-        print("Using synthetic mock data to generate figures...")
+        print("WARNING: generating SYNTHETIC figures (--mock). Not empirical evidence.")
         data = generate_mock_data()
     else:
-        if not args.eval_results or not os.path.exists(args.eval_results):
-            print("Error: Must provide --eval-results path or use --mock.")
-            return
-            
-        print(f"Parsing actual results from {args.eval_results}...")
-        # Fall back to mock data for demonstration
-        print("Real data parsing is a placeholder. Falling back to mock data for demonstration.")
-        data = generate_mock_data()
+        if not args.eval_results:
+            parser.error("--eval-results is required unless --mock is given")
+        if not Path(args.eval_results).exists():
+            parser.error(f"eval results not found: {args.eval_results}")
+        print(f"Parsing real results from {args.eval_results}...")
+        data = load_eval_data(args.eval_results)
 
-    print(f"Saving figures to {out_dir}...")
-    plot_qtype_heatmap(data["qtype_heatmap"], out_dir)
-    plot_concept_attribution(data["concept_attribution"], out_dir)
-    plot_intervention_delta(data["intervention_delta"], out_dir)
-    plot_failure_taxonomy(data["failure_taxonomy"], out_dir)
-    plot_efficiency_scatter(data["efficiency_scatter"], out_dir)
-    print("Done! All 5 figures generated successfully.")
+    generated = 0
+    for plotter in PLOTTERS:
+        if plotter(data, out_dir, args.mock):
+            generated += 1
+        else:
+            print(f"  skipped {plotter.__name__}: required fields not present in eval data")
+    print(f"Done. {generated}/{len(PLOTTERS)} figures written to {out_dir}.")
+
 
 if __name__ == "__main__":
     main()

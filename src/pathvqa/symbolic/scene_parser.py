@@ -9,20 +9,46 @@ import torch.nn as nn
 from pathvqa.models.protocols import SceneParserOutput
 
 
-COLOR_VALUES = ["yellow", "red", "grey", "white", "blue", "pale", "black",
-                "tan", "pink", "dark", "green", "gray", "purple", "clear",
-                "brown", "whitish", "yellowish"]
-SHAPE_VALUES = ["irregular", "tubular", "round", "spindle", "oval",
-                "elongated", "stellate", "polygonal", "spherical"]
-SIZE_VALUES = ["large", "small", "enlarged", "marked", "gross", "massive",
-               "microscopic", "moderate", "minimal", "tiny", "medium"]
-DENSITY_VALUES = ["sparse", "moderate", "dense", "crowded"]
+COLOR_VALUES = [
+    "yellow",
+    "red",
+    "grey",
+    "white",
+    "blue",
+    "pale",
+    "black",
+    "tan",
+    "pink",
+    "dark",
+    "green",
+    "gray",
+    "purple",
+    "clear",
+    "brown",
+    "whitish",
+    "yellowish",
+]
+SHAPE_VALUES = ["irregular", "tubular", "round", "spindle", "oval", "elongated", "stellate", "polygonal", "spherical"]
+SIZE_VALUES = [
+    "large",
+    "small",
+    "enlarged",
+    "marked",
+    "gross",
+    "massive",
+    "microscopic",
+    "moderate",
+    "minimal",
+    "tiny",
+    "medium",
+]
 
 
 class SceneParser(nn.Module):
     """Projects attended features to region, object-presence, and attribute logits."""
 
     def __init__(self, visual_dim: int, num_regions: int):
+        """Project ``visual_dim`` features onto the region, object and attribute axes."""
         super().__init__()
         self.num_regions = num_regions
 
@@ -35,8 +61,6 @@ class SceneParser(nn.Module):
         self.color_classifier = nn.Linear(visual_dim, len(COLOR_VALUES))
         self.shape_classifier = nn.Linear(visual_dim, len(SHAPE_VALUES))
         self.size_classifier = nn.Linear(visual_dim, len(SIZE_VALUES))
-        # Nuclei density head (domain-specific for histopathology)
-        self.density_classifier = nn.Linear(visual_dim, len(DENSITY_VALUES))
 
     def forward(self, attended_features: torch.Tensor) -> SceneParserOutput:
         """Predict scene attributes from attended features."""
@@ -45,23 +69,21 @@ class SceneParser(nn.Module):
         color_logits = self.color_classifier(attended_features)
         shape_logits = self.shape_classifier(attended_features)
         size_logits = self.size_classifier(attended_features)
-        density_logits = self.density_classifier(attended_features)
-        
-        # Shape assertions (P4)
+
+        # Defensive shape checks: these heads feed scatter-add writes whose
+        # indices are derived from these very dimensions.
         batch = attended_features.size(0)
         assert region_logits.shape == (batch, self.num_regions)
         assert object_logits.shape == (batch, self.num_regions)
         assert color_logits.shape == (batch, len(COLOR_VALUES))
         assert shape_logits.shape == (batch, len(SHAPE_VALUES))
         assert size_logits.shape == (batch, len(SIZE_VALUES))
-        assert density_logits.shape == (batch, len(DENSITY_VALUES))
         return SceneParserOutput(
             region_logits=region_logits,
             object_presence=object_logits,
             color_logits=color_logits,
             shape_logits=shape_logits,
             size_logits=size_logits,
-            density_logits=density_logits,
         )
 
 
@@ -70,10 +92,10 @@ if __name__ == "__main__":
     parser = SceneParser(visual_dim=512, num_regions=10)
     dummy = torch.randn(4, 512)
     out = parser(dummy)
-    print(f"Region logits: {out['region_logits'].shape}")
-    print(f"Object presence: {out['object_presence'].shape}")
-    print(f"Color logits: {out['color_logits'].shape}")
-    print(f"Shape logits: {out['shape_logits'].shape}")
-    print(f"Size logits: {out['size_logits'].shape}")
+    print(f"Region logits: {out.region_logits.shape}")
+    print(f"Object presence: {out.object_presence.shape}")
+    print(f"Color logits: {out.color_logits.shape}")
+    print(f"Shape logits: {out.shape_logits.shape}")
+    print(f"Size logits: {out.size_logits.shape}")
     print(f"Num colors={len(COLOR_VALUES)}, shapes={len(SHAPE_VALUES)}, sizes={len(SIZE_VALUES)}")
     print("SceneParser test passed!")

@@ -1,0 +1,66 @@
+"""Tests for the canonical A-E ablation matrix (single source of truth)."""
+
+import pytest
+
+from pathvqa.utils.ablation import (
+    ABLATION_CHOICES,
+    ABLATION_CONFIGS,
+    ABLATION_LABELS,
+    apply_ablation,
+)
+from pathvqa.utils.config import get_default_config
+
+
+def test_matrix_values_match_documented_semantics():
+    """The A-E matrix must encode exactly the documented pipelines."""
+    assert ABLATION_CONFIGS == {
+        "A": {"query_parser": "regex", "executor": "hard", "weighting_strategy": "static"},
+        "B": {"query_parser": "regex", "executor": "hard", "weighting_strategy": "learned"},
+        "C": {"query_parser": "learned", "executor": "differentiable", "weighting_strategy": "learned"},
+        "D": {"query_parser": "learned", "executor": "differentiable", "weighting_strategy": "static"},
+        "E": {"query_parser": "regex", "executor": "differentiable", "weighting_strategy": "learned"},
+    }
+
+
+def test_choices_and_labels_cover_every_key():
+    assert ABLATION_CHOICES == sorted(ABLATION_CONFIGS)
+    assert set(ABLATION_LABELS) == set(ABLATION_CONFIGS)
+    assert len(set(ABLATION_LABELS.values())) == len(ABLATION_LABELS)
+
+
+@pytest.mark.parametrize("key", sorted(ABLATION_CONFIGS))
+def test_apply_ablation_sets_all_three_fields(key):
+    cfg = get_default_config()
+    apply_ablation(cfg, key)
+    expected = ABLATION_CONFIGS[key]
+    assert cfg.symbolic.query_parser == expected["query_parser"]
+    assert cfg.symbolic.executor == expected["executor"]
+    assert cfg.symbolic.weighting_strategy == expected["weighting_strategy"]
+
+
+def test_apply_ablation_unknown_raises():
+    cfg = get_default_config()
+    with pytest.raises(ValueError, match="Unknown ablation"):
+        apply_ablation(cfg, "Z")
+
+
+def test_evaluate_reexports_canonical_matrix():
+    """evaluate.py must re-export the canonical definitions, not a copy.
+
+    The matrix used to be duplicated between train.py and evaluate.py and could
+    drift; guard against a future re-introduction of a private copy.
+    """
+    import evaluate
+
+    assert evaluate.ABLATION_CONFIGS is ABLATION_CONFIGS
+    assert evaluate.apply_ablation is apply_ablation
+
+
+def test_train_cli_ablation_override_uses_canonical_matrix():
+    from train import apply_cli_overrides
+
+    cfg = get_default_config()
+    apply_cli_overrides(cfg, {"ablation": "E"})
+    assert cfg.symbolic.query_parser == "regex"
+    assert cfg.symbolic.executor == "differentiable"
+    assert cfg.symbolic.weighting_strategy == "learned"

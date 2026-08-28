@@ -1,4 +1,4 @@
-"""Unit tests for DSL Program Compiler and Differentiable Interpreter (N4)."""
+"""Unit tests for the DSL program compiler and differentiable interpreter."""
 
 import torch
 from pathvqa.symbolic.dsl import DSLProgramCompiler, DifferentiableDSLInterpreter, DSLNode
@@ -7,7 +7,7 @@ from pathvqa.symbolic.query_parser import parse_question
 
 def test_dsl_program_compiler():
     compiler = DSLProgramCompiler()
-    
+
     # Count
     p_count = compiler.compile("How many nuclei are seen?", target="nuclei", qtype="count")
     assert p_count.op == "Count"
@@ -23,11 +23,11 @@ def test_dsl_program_compiler():
     p_attr = compiler.compile("What color is the cytoplasm?", target="cytoplasm", attribute="color", qtype="attribute")
     assert p_attr.op == "QueryAttr"
     assert p_attr.args["attribute"] == "color"
-    
+
     # Relate
     p_relate = compiler.compile("Is there a nucleus inside the cell?", target="nucleus", qtype="relate")
     assert p_relate.op == "Relate"
-    
+
     # Exist
     p_exist = compiler.compile("Is a lesion present?", target="lesion", qtype="exist")
     assert p_exist.op == "Exist"
@@ -41,7 +41,7 @@ def test_differentiable_dsl_interpreter():
     prog_count = DSLNode(op="Count", args={"target": "nuclei"}, child=DSLNode(op="Filter", args={"concept": "nuclei"}))
     out = interpreter(prog_count, dummy_patches, {}, vocab)
     assert out.shape == (4, len(vocab))
-    
+
     # Gradient flow check
     loss = out.sum()
     loss.backward()
@@ -57,6 +57,7 @@ def test_query_parser_dsl_integration():
 
 def test_query_attr_interpreter():
     from pathvqa.symbolic.executor import build_attribute_mappings, COLOR_VALUES
+
     vocab = {"yes": 0, "no": 1, "red": 2, "blue": 3, "yellow": 4, "large": 5}
     attr_maps = build_attribute_mappings(vocab)
 

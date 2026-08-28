@@ -11,18 +11,26 @@ Endpoints:
     GET  /model/info       — checkpoint metadata
 """
 
+import logging
 import os
 import argparse
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
+from PIL.Image import UnidentifiedImageError
 
 from pathvqa.api.schemas import (
-    PredictRequest, PredictResponse, ExplainResponse,
-    HealthResponse, ModelInfoResponse, SymbolicTrace,
+    PredictRequest,
+    PredictResponse,
+    ExplainResponse,
+    HealthResponse,
+    ModelInfoResponse,
+    SymbolicTrace,
 )
 from pathvqa.api.inference import PathVQAInference
+
+logger = logging.getLogger("pathvqa.serve")
 
 # Set by startup; loaded once and reused across requests.
 _inference: PathVQAInference | None = None
@@ -34,6 +42,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     checkpoint = os.environ.get("CHECKPOINT_PATH")
     if checkpoint:
         _inference = PathVQAInference(checkpoint)
+    else:
+        logging.getLogger("pathvqa.serve").warning(
+            "CHECKPOINT_PATH is not set; all endpoints will return 503 until a checkpoint is configured"
+        )
     yield
 
 
@@ -71,8 +83,14 @@ def predict(req: PredictRequest):
     inf = get_inference()
     try:
         result = inf.predict(req.image_base64, req.question)
-    except Exception as e:
+    except (ValueError, KeyError, UnidentifiedImageError) as e:
+        # Client-input problems: bad base64, undecodable image, malformed text.
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        # Internal bugs must not masquerade as client errors and must not
+        # leak stack traces in the response body.
+        logger.exception("Prediction failed")
+        raise HTTPException(status_code=500, detail="Internal prediction error")
     return PredictResponse(**result)
 
 
@@ -81,8 +99,11 @@ def predict_explain(req: PredictRequest):
     inf = get_inference()
     try:
         result = inf.explain(req.image_base64, req.question)
-    except Exception as e:
+    except (ValueError, KeyError, UnidentifiedImageError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("Explanation failed")
+        raise HTTPException(status_code=500, detail="Internal explanation error")
     return ExplainResponse(
         answer=result["answer"],
         confidence=result["confidence"],
@@ -101,6 +122,7 @@ def main():
     os.environ["CHECKPOINT_PATH"] = args.checkpoint
 
     import uvicorn
+
     print(f"Loading model from {args.checkpoint}...")
     uvicorn.run(app, host=args.host, port=args.port)
 

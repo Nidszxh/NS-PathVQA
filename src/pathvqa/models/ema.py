@@ -22,8 +22,12 @@ class ModelEMA:
         self.register(model)
 
     def register(self, model: nn.Module) -> None:
-        """Snapshot current weights as initial EMA state. Tracks all params + buffers
-        so the EMA state_dict matches model.state_dict() key-for-key."""
+        """Snapshot current weights as initial EMA state.
+
+        Tracks every floating-point parameter and buffer. Integer buffers
+        (e.g. ``num_batches_tracked``) are skipped, so ``shadow`` is a
+        floating-point subset of ``model.state_dict()``, not an exact mirror.
+        """
         for name, param in model.named_parameters():
             if param.is_floating_point():
                 self.shadow[name] = param.detach().clone()
@@ -56,6 +60,7 @@ class ModelEMA:
 
     @staticmethod
     def _load_into(model: nn.Module, state: Dict[str, torch.Tensor]) -> None:
+        """Copy every tensor present in ``state`` back into the model in place."""
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if name in state:
@@ -65,9 +70,11 @@ class ModelEMA:
                     buf.copy_(state[name])
 
     def state_dict(self) -> Dict[str, torch.Tensor]:
+        """Return a detached clone of the current shadow weights."""
         return {k: v.clone() for k, v in self.shadow.items()}
 
     def load_state_dict(self, state: Dict[str, torch.Tensor]) -> None:
+        """Replace the shadow weights with a clone of ``state``."""
         self.shadow = {k: v.clone() for k, v in state.items()}
 
 

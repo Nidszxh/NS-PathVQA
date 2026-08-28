@@ -140,7 +140,8 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
-checkpoints/
-data/
-logs/
-outputs/
+/checkpoints/
+/data/
+/logs/
+/outputs/
+/scratch/

@@ -1,3 +1,5 @@
+"""Shared pytest fixtures for the PathVQA test suite."""
+
 import pytest
 
 SAMPLE_ANSWER_VOCAB = [

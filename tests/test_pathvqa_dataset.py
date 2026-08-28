@@ -1,6 +1,14 @@
+"""Text normalization, aspect-preserving resize, answer lookup, and image caching."""
+
 from pathvqa.data.pathvqa_dataset import (
-    normalize_text, resize_keep_aspect, lookup_answer_idx,
-    cache_key, ImageCache, IMAGENET_MEAN, IMAGENET_STD,
+    normalize_text,
+    resize_keep_aspect,
+    lookup_answer_idx,
+    cache_key,
+    TRANSFORM_VERSION,
+    ImageCache,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
 )
 from PIL import Image
 import torch
@@ -29,19 +37,41 @@ def _img(w, h):
     return Image.new("RGB", (w, h), color=(128, 64, 32))
 
 
-@pytest.mark.parametrize("w,h", [
-    (492, 369), (309, 272), (210, 267), (177, 275), (640, 320),
-    (100, 50), (320, 240), (526, 528), (45, 67), (2000, 1000),
-])
+@pytest.mark.parametrize(
+    "w,h",
+    [
+        (492, 369),
+        (309, 272),
+        (210, 267),
+        (177, 275),
+        (640, 320),
+        (100, 50),
+        (320, 240),
+        (526, 528),
+        (45, 67),
+        (2000, 1000),
+    ],
+)
 def test_resize_keep_aspect_exact_output_size(w, h):
     out = resize_keep_aspect(_img(w, h), (320, 240))
     assert out.size == (320, 240)
 
 
-@pytest.mark.parametrize("w,h", [
-    (492, 369), (309, 272), (210, 267), (177, 275), (640, 320),
-    (100, 50), (526, 528), (45, 67), (2000, 1000), (320, 240),
-])
+@pytest.mark.parametrize(
+    "w,h",
+    [
+        (492, 369),
+        (309, 272),
+        (210, 267),
+        (177, 275),
+        (640, 320),
+        (100, 50),
+        (526, 528),
+        (45, 67),
+        (2000, 1000),
+        (320, 240),
+    ],
+)
 def test_resize_keep_aspect_no_distortion(w, h):
     """A single scalar scale applied to both axes = uniform, no stretching."""
     out_w, out_h = 320, 240
@@ -79,10 +109,12 @@ def test_lookup_answer_idx_raises_without_unk():
         lookup_answer_idx("gastrointestinal system", vocab)
 
 
-def test_cache_key_encodes_image_size_and_norm():
-    assert cache_key((320, 240)) == "320x240_imagenet"
-    assert cache_key((224, 224), norm="clip") == "224x224_clip"
-    # Phase 3's CLIP-norm + 224×224 swap must not collide with the ResNet cache.
+def test_cache_key_encodes_image_size_norm_and_version():
+    # Regression: cache keys must include the transform version so stale
+    # tensors are never reused after preprocessing changes.
+    assert cache_key((320, 240)) == f"320x240_imagenet_{TRANSFORM_VERSION}"
+    assert cache_key((224, 224), norm="clip") == f"224x224_clip_{TRANSFORM_VERSION}"
+    # Different (size, norm) combos must land in distinct cache directories.
     assert cache_key((320, 240)) != cache_key((224, 224), norm="clip")
 
 
@@ -95,22 +127,22 @@ def test_image_cache_writes_and_reloads_uint8(tmp_path):
     # Second call hits disk (no rewrite) and must be byte-identical.
     t2 = cache.get(0, img)
     assert torch.equal(t, t2)
-    assert (tmp_path / "320x240_imagenet" / "train" / "0000000.pt").exists()
+    assert (tmp_path / cache_key((320, 240)) / "train" / "0000000.pt").exists()
 
 
 def test_image_cache_keys_by_norm(tmp_path):
     img = Image.new("RGB", (320, 240))
     ImageCache(tmp_path, "val", (320, 240), norm="imagenet").get(0, img)
     ImageCache(tmp_path, "val", (320, 240), norm="clip").get(1, img)
-    assert (tmp_path / "320x240_imagenet" / "val" / "0000000.pt").exists()
-    assert (tmp_path / "320x240_clip" / "val" / "0000001.pt").exists()
+    assert (tmp_path / cache_key((320, 240)) / "val" / "0000000.pt").exists()
+    assert (tmp_path / cache_key((320, 240), norm="clip") / "val" / "0000001.pt").exists()
 
 
 def test_image_cache_atomic_write(tmp_path):
     img = Image.new("RGB", (320, 240), color=(10, 20, 30))
     cache = ImageCache(tmp_path, "train", (320, 240))
     cache.get(5, img)
-    files = list((tmp_path / "320x240_imagenet" / "train").iterdir())
+    files = list((tmp_path / cache_key((320, 240)) / "train").iterdir())
     assert all(".tmp" not in f.name for f in files), "no temp files left behind"
 
 

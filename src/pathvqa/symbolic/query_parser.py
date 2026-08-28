@@ -7,15 +7,13 @@ from dataclasses import dataclass
 import re
 from typing import List, Optional
 
-try:
-    from pathvqa.symbolic.dsl import DSLNode, DSLProgramCompiler
-except ImportError:
-    from dsl import DSLNode, DSLProgramCompiler
+from pathvqa.symbolic.dsl import DSLNode, DSLProgramCompiler
 
 
 @dataclass
 class Query:
     """Structured representation of a parsed question."""
+
     qtype: str
     target: str = ""
     attribute: str = ""
@@ -43,20 +41,22 @@ ATTRIBUTE_PATTERNS = {
     "color": r"what colo[u]?r",
     "size": r"what (?:size|is the size)",
     "shape": r"what shape",
-    "type": r"what (?:type|kind|variety)",
+    # NOTE: no "type" head exists in the scene parser; "what type/kind" questions
+    # fall through to identity handling below instead of a symbolic dead end.
 }
 
 
 def _extract_target(question: str, answer_vocab: List[str]) -> str:
     """Find the most specific word/phrase from the question in the answer vocabulary."""
     q = question.lower()
-    words = set(re.findall(r"\b[a-z]+\b", q))
-    for word in sorted(words, key=len, reverse=True):
+    words = {str(w) for w in re.findall(r"\b[a-z]+\b", q)}
+    # Deterministic tie-break: equal-length words must not depend on set/hash order
+    for word in sorted(words, key=lambda w: (-len(w), w)):
         if word in answer_vocab:
             return word
     for phrase_len in range(4, 0, -1):
         for i in range(len(q.split()) - phrase_len + 1):
-            phrase = " ".join(q.split()[i:i+phrase_len])
+            phrase = " ".join(q.split()[i : i + phrase_len])
             if phrase in answer_vocab:
                 return phrase
     return ""
@@ -113,5 +113,7 @@ if __name__ == "__main__":
     dummy_vocab = ["lesion", "malignant", "tumor", "nuclei", "cells"]
     for q in test_questions:
         result = parse_question(q, dummy_vocab)
-        print(f"  {q:45s} → qtype={result.qtype:10s} target={result.target:15s} AST={result.program.op if result.program else None}")
+        print(
+            f"  {q:45s} → qtype={result.qtype:10s} target={result.target:15s} AST={result.program.op if result.program else None}"
+        )
     print("QueryParser test passed!")

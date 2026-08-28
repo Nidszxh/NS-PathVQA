@@ -10,8 +10,14 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.12.1",
+    "torchvision>=0.20.0",
     "transformers>=5.12.1",
     "peft>=0.20.0",
+    "datasets>=2.0.0",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "tqdm>=4.66",
+    "tensorboard>=2.15",
     "fastapi>=0.139.0",
     "uvicorn>=0.49.0",
     "matplotlib>=3.7.0",
@@ -29,9 +35,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]
 addopts = "-q --cov=src/pathvqa --cov-report=xml --cov-fail-under=80"
-filterwarnings = ["ignore:TruncatedFileError"]
+filterwarnings = ["ignore:Truncated File Read"]
 
 [tool.ruff]
 target-version = "py312"
@@ -47,3 +53,7 @@ python_version = "3.12"
 mypy_path = "src"
 warn_unused_ignores = true
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["torchvision.*", "datasets.*", "scipy.*"]
+ignore_missing_imports = true

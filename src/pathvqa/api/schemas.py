@@ -1,6 +1,6 @@
 """Pydantic request/response schemas for the PathVQA inference API."""
 
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
@@ -23,12 +23,13 @@ class SymbolicTrace(BaseModel):
     grounding_boxes: Optional[List[List[float]]] = Field(
         None, description="Top attended patch bounding boxes [x1, y1, x2, y2] normalized to [0, 1]"
     )
+    heatmap_2d: Optional[List[List[float]]] = Field(
+        None, description="Visual grounding heatmap reshaped to the patch grid (rows × cols)"
+    )
     counterfactual_explanation: Optional[str] = Field(
         None, description="Clinically interpretable counterfactual hypothesis"
     )
-    reasoning_tree: Optional[dict] = Field(
-        None, description="Hierarchical step-by-step logic deduction tree"
-    )
+    reasoning_tree: Optional[Dict[str, Any]] = Field(None, description="Hierarchical step-by-step logic deduction tree")
 
 
 class PredictResponse(BaseModel):

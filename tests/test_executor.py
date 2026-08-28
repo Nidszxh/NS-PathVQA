@@ -1,3 +1,5 @@
+"""Symbolic executor: region/attribute mapping and each qtype branch."""
+
 import torch
 
 from pathvqa.symbolic.executor import (
@@ -21,7 +23,6 @@ def _make_scene_logits(batch_size, num_regions):
         shape_logits=torch.randn(batch_size, len(SHAPE_VALUES)),
         size_logits=torch.randn(batch_size, len(SIZE_VALUES)),
         object_presence=torch.randn(batch_size, num_regions),
-        density_logits=torch.randn(batch_size, 3)
     )
 
 
@@ -49,8 +50,14 @@ def test_execute_identity_boosts_region_entries(answer_vocab, answer_to_idx):
     queries = [Query(qtype="identity", target="lung")]
     neural = torch.zeros(1, len(answer_vocab))
     result = execute(
-        scene_logits, queries, regions, region_mapping, attr_mappings,
-        answer_to_idx, len(answer_vocab), neural,
+        scene_logits,
+        queries,
+        regions,
+        region_mapping,
+        attr_mappings,
+        answer_to_idx,
+        len(answer_vocab),
+        neural,
     )
     assert result.trace["symbolic_used"] == [True]
     assert result.symbolic_logits.shape == (1, len(answer_vocab))
@@ -66,8 +73,14 @@ def test_execute_yes_no_boosts_binary_classes(answer_vocab, answer_to_idx):
     queries = [Query(qtype="yes_no", target="lung")]
     neural = torch.zeros(1, len(answer_vocab))
     result = execute(
-        scene_logits, queries, regions, region_mapping, attr_mappings,
-        answer_to_idx, len(answer_vocab), neural,
+        scene_logits,
+        queries,
+        regions,
+        region_mapping,
+        attr_mappings,
+        answer_to_idx,
+        len(answer_vocab),
+        neural,
     )
     assert result.trace["symbolic_used"] == [True]
     assert result.symbolic_logits.shape == (1, len(answer_vocab))
@@ -87,8 +100,14 @@ def test_execute_yes_no_uses_max_region_confidence(answer_vocab, answer_to_idx):
     queries = [Query(qtype="yes_no", target="lung")]
     neural = torch.zeros(1, len(answer_vocab))
     result = execute(
-        scene_logits, queries, regions, region_mapping, attr_mappings,
-        answer_to_idx, len(answer_vocab), neural,
+        scene_logits,
+        queries,
+        regions,
+        region_mapping,
+        attr_mappings,
+        answer_to_idx,
+        len(answer_vocab),
+        neural,
     )
     yn_val = result.symbolic_logits[0, answer_to_idx["yes"]]
     no_val = result.symbolic_logits[0, answer_to_idx["no"]]
@@ -103,8 +122,14 @@ def test_execute_count_is_noop(answer_vocab, answer_to_idx):
     queries = [Query(qtype="count", target="nuclei")] * 2
     neural = torch.zeros(2, len(answer_vocab))
     result = execute(
-        scene_logits, queries, regions, region_mapping, attr_mappings,
-        answer_to_idx, len(answer_vocab), neural,
+        scene_logits,
+        queries,
+        regions,
+        region_mapping,
+        attr_mappings,
+        answer_to_idx,
+        len(answer_vocab),
+        neural,
     )
     assert result.trace["symbolic_used"] == [False, False]
     assert torch.equal(result.symbolic_logits, torch.zeros_like(result.symbolic_logits))
@@ -116,21 +141,26 @@ def test_execute_missing_region_logits_returns_zeros(answer_vocab, answer_to_idx
     attr_mappings = build_attribute_mappings(answer_to_idx)
     queries = [Query(qtype="identity")]
     neural = torch.zeros(1, len(answer_vocab))
-    
+
     empty_scene = SceneParserOutput(
         region_logits=None,
         color_logits=None,
         shape_logits=None,
         size_logits=None,
         object_presence=None,
-        density_logits=None
     )
-    
+
     result = execute(
-        empty_scene, queries, regions, region_mapping, attr_mappings,
-        answer_to_idx, len(answer_vocab), neural,
+        empty_scene,
+        queries,
+        regions,
+        region_mapping,
+        attr_mappings,
+        answer_to_idx,
+        len(answer_vocab),
+        neural,
     )
-    assert result.region_logits is None
+    assert result.region_logits.numel() == 0  # sentinel: no region head available
     assert torch.equal(result.symbolic_logits, torch.zeros_like(result.symbolic_logits))
     assert result.trace["symbolic_used"] == [False]
 
@@ -150,8 +180,14 @@ def test_execute_mixed_qtypes(answer_vocab, answer_to_idx):
     ]
     neural = torch.zeros(batch_size, len(answer_vocab))
     result = execute(
-        scene_logits, queries, regions, region_mapping, attr_mappings,
-        answer_to_idx, len(answer_vocab), neural,
+        scene_logits,
+        queries,
+        regions,
+        region_mapping,
+        attr_mappings,
+        answer_to_idx,
+        len(answer_vocab),
+        neural,
     )
     assert result.trace["symbolic_used"] == [True, True, True, False]
     assert result.symbolic_logits.shape == (batch_size, len(answer_vocab))
@@ -170,8 +206,14 @@ def test_vectorized_executor_matches_execute(answer_vocab, answer_to_idx):
     neural = torch.zeros(2, len(answer_vocab))
 
     result = execute(
-        scene_logits, queries, regions, region_mapping, attr_mappings,
-        answer_to_idx, len(answer_vocab), neural,
+        scene_logits,
+        queries,
+        regions,
+        region_mapping,
+        attr_mappings,
+        answer_to_idx,
+        len(answer_vocab),
+        neural,
     )
     vec_executor = VectorizedSymbolicExecutor(regions, answer_to_idx, attr_mappings)
     vec_out = vec_executor(scene_logits, queries, neural)

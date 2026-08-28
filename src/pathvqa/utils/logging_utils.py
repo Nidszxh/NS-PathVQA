@@ -6,13 +6,14 @@ from pathlib import Path
 from typing import Optional
 
 
-def setup_logging(level: int = logging.INFO,
-                  log_file: Optional[Path] = None) -> logging.Logger:
+def setup_logging(level: int = logging.INFO, log_file: Optional[Path] = None) -> logging.Logger:
     """Configure the root ``pathvqa`` logger with optional file output."""
     logger = logging.getLogger("pathvqa")
     logger.setLevel(level)
     logger.propagate = False
-    logger.handlers.clear()
+    for handler in list(logger.handlers):
+        handler.close()  # release file handles before dropping them
+        logger.removeHandler(handler)
 
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -27,7 +28,7 @@ def setup_logging(level: int = logging.INFO,
     if log_file is not None:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         fh = logging.FileHandler(log_file, encoding="utf-8")
-        fh.setLevel(logging.INFO)
+        fh.setLevel(level)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
 

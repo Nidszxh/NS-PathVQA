@@ -2,11 +2,12 @@
 
 import torch
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 
-def expected_calibration_error(logits: torch.Tensor, labels: torch.Tensor,
-                                n_bins: int = 10) -> Tuple[float, List[Dict]]:
+def expected_calibration_error(
+    logits: torch.Tensor, labels: torch.Tensor, n_bins: int = 10
+) -> Tuple[float, List[Dict[str, float]]]:
     """Compute Expected Calibration Error (ECE) across n_bins confidence bins."""
     probs = torch.softmax(logits, dim=1)
     confidences, predictions = probs.max(dim=1)
@@ -24,45 +25,50 @@ def expected_calibration_error(logits: torch.Tensor, labels: torch.Tensor,
             bin_conf = confidences[mask].mean().item()
             bin_size = mask.sum().item()
             ece += abs(bin_acc - bin_conf) * bin_size / len(labels)
-            bin_stats.append({
-                "bin_lower": low.item(),
-                "bin_upper": high.item(),
-                "accuracy": bin_acc,
-                "confidence": bin_conf,
-                "count": bin_size,
-            })
+            bin_stats.append(
+                {
+                    "bin_lower": low.item(),
+                    "bin_upper": high.item(),
+                    "accuracy": bin_acc,
+                    "confidence": bin_conf,
+                    "count": bin_size,
+                }
+            )
         else:
-            bin_stats.append({
-                "bin_lower": low.item(),
-                "bin_upper": high.item(),
-                "accuracy": 0.0,
-                "confidence": 0.0,
-                "count": 0,
-            })
+            bin_stats.append(
+                {
+                    "bin_lower": low.item(),
+                    "bin_upper": high.item(),
+                    "accuracy": 0.0,
+                    "confidence": 0.0,
+                    "count": 0,
+                }
+            )
 
     return ece, bin_stats
 
 
-def temperature_scaling(logits: torch.Tensor, labels: torch.Tensor,
-                         lr: float = 0.01, max_iter: int = 100) -> float:
+def temperature_scaling(logits: torch.Tensor, labels: torch.Tensor, lr: float = 0.01, max_iter: int = 100) -> float:
     """Learn optimal temperature for post-hoc temperature scaling.
 
     Optimizes T so that softmax(logits / T) is better calibrated.
-    Uses L-BFGS on cross-entropy loss.
+    Uses L-BFGS on cross-entropy loss. The temperature parameter is created
+    on the same device as ``logits`` so CUDA-resident inputs work directly.
     """
-    T = torch.ones(1, requires_grad=True)
+    T = torch.ones(1, requires_grad=True, device=logits.device)
     optimizer = torch.optim.LBFGS([T], lr=lr, max_iter=max_iter)
     criterion = torch.nn.CrossEntropyLoss()
 
-    def eval_step():
+    def eval_step() -> torch.Tensor:
         optimizer.zero_grad()
         scaled_logits = logits / T
         loss = criterion(scaled_logits, labels)
-        loss.backward()
+        assert isinstance(loss, torch.Tensor)
+        loss.backward()  # type: ignore[no-untyped-call]
         return loss
 
-    optimizer.step(eval_step)
-    return T.item()
+    optimizer.step(eval_step)  # type: ignore[no-untyped-call]
+    return float(T.item())
 
 
 def compute_uncertainty(logits: torch.Tensor, method: str = "max_softmax") -> torch.Tensor:
@@ -80,17 +86,63 @@ def compute_uncertainty(logits: torch.Tensor, method: str = "max_softmax") -> to
         raise ValueError(f"Unknown uncertainty method: {method}")
 
 
-def paired_bootstrap_test(acc1: float, acc2: float, n1: int, n2: int,
-                           n_bootstrap: int = 10000, seed: int = 42) -> float:
-    """Paired bootstrap test for comparing two accuracy values (approximate, conservative)."""
+def two_sample_bootstrap_test(
+    acc1: float, acc2: float, n1: int, n2: int, n_bootstrap: int = 10000, seed: int = 42
+) -> float:
+    """Two-sample bootstrap significance test for two independent accuracy values.
+
+    Builds the null distribution by re-centering each bootstrap replicate at
+    zero (``D0_b = D_boot - D_observed``) and reports the fraction of null
+    replicates at least as extreme as the observed difference. With scalar
+    accuracies this is the standard recentered (basic) bootstrap; it treats the
+    two samples as independent. For aligned per-example correctness use
+    :func:`paired_bootstrap_test` instead.
+    """
     rng = np.random.RandomState(seed)
     diff_observed = acc1 - acc2
+    if diff_observed == 0.0:
+        return 1.0  # no observed effect: never significant
     count = 0
-    # p-value: fraction of bootstrap samples where |Δ_boot| ≥ |Δ_observed|
     for _ in range(n_bootstrap):
         boot1 = rng.binomial(n1, acc1) / n1
         boot2 = rng.binomial(n2, acc2) / n2
-        if abs(boot1 - boot2) >= abs(diff_observed):
+        # Shift the replicate to the null (mean-zero) distribution.
+        d_null = (boot1 - boot2) - diff_observed
+        if abs(d_null) >= abs(diff_observed):
             count += 1
 
     return count / n_bootstrap
+
+
+def paired_bootstrap_test(
+    correct_a: Sequence[float],
+    correct_b: Sequence[float],
+    n_bootstrap: int = 10000,
+    seed: int = 42,
+) -> float:
+    """Paired bootstrap significance test over per-example correctness.
+
+    ``correct_a``/``correct_b`` are aligned per-example correctness values
+    (e.g. 0/1 indicators) for two models evaluated on the *same* examples.
+    Resampling is over examples (the same indices for both models), which is
+    the correct test when the two systems share a test set. Returns the
+    two-sided p-value for the null hypothesis of equal accuracy.
+    """
+    a = np.asarray(correct_a, dtype=float)
+    b = np.asarray(correct_b, dtype=float)
+    if a.shape != b.shape:
+        raise ValueError(f"correctness vectors must be aligned; got {a.shape} and {b.shape}")
+    n = a.size
+    if n == 0:
+        raise ValueError("correctness vectors must be non-empty")
+
+    diff = a - b
+    observed = float(diff.mean())
+    if observed == 0.0:
+        return 1.0
+
+    rng = np.random.RandomState(seed)
+    resample_idx = rng.randint(0, n, size=(n_bootstrap, n))
+    boot_diff = diff[resample_idx].mean(axis=1)
+    centered = boot_diff - observed
+    return float(np.mean(np.abs(centered) >= abs(observed)))

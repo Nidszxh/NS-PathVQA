@@ -1,3 +1,6 @@
+"""Exponential moving average of model weights."""
+
+import pytest
 import torch
 from pathvqa.models.ema import ModelEMA
 
@@ -40,3 +43,29 @@ def test_ema_shadow_covers_full_state_dict():
     model = torch.nn.Linear(4, 2)
     ema = ModelEMA(model, decay=0.9)
     assert set(ema.shadow.keys()) == set(dict(model.state_dict()).keys())
+
+
+def test_ema_rejects_invalid_decay():
+    model = torch.nn.Linear(4, 2)
+    with pytest.raises(ValueError):
+        ModelEMA(model, decay=1.0)
+
+
+def test_ema_tracks_buffers():
+    """Floating-point buffers (e.g. BatchNorm running stats) are EMA-tracked too."""
+    model = torch.nn.Sequential(torch.nn.Linear(4, 2), torch.nn.BatchNorm1d(2))
+    ema = ModelEMA(model, decay=0.5)
+    assert "1.running_mean" in ema.shadow
+    old_stats = ema.shadow["1.running_mean"].clone()
+    with torch.no_grad():
+        # Simulate a training step updating the buffer
+        torch.nn.init.normal_(model[1].running_mean)
+    ema.update(model)
+    expected = 0.5 * old_stats + 0.5 * model[1].running_mean.detach()
+    torch.testing.assert_close(ema.shadow["1.running_mean"], expected)
+
+    trained_stat = model[1].running_mean.detach().clone()
+    ema.apply_shadow(model)
+    torch.testing.assert_close(model[1].running_mean, ema.shadow["1.running_mean"])
+    ema.restore(model)
+    torch.testing.assert_close(model[1].running_mean, trained_stat)

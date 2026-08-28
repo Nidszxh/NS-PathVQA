@@ -1,3 +1,5 @@
+"""Rule-based query parser: qtype classification and target extraction."""
+
 from pathvqa.symbolic.query_parser import parse_question
 
 

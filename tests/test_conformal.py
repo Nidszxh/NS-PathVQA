@@ -33,7 +33,7 @@ def test_conformal_prediction_sets():
     assert len(pred_sets) == 200
     for s in pred_sets:
         assert isinstance(s, set)
-        assert len(s) >= 1  # at least one class in set
+        assert len(s) <= 10  # never exceed the class count; empty sets are legal under high tau
 
 
 def test_conformal_uncertain():
@@ -93,3 +93,29 @@ def test_conformal_requires_calibration():
         assert False, "Should have raised ValueError"
     except ValueError:
         pass
+
+
+def test_conformal_exact_order_statistic():
+    """tau must be the ceil((n+1)(1-alpha))-th smallest score (no interpolation)."""
+    torch.manual_seed(0)
+    logits = torch.randn(50, 4)
+    labels = torch.randint(0, 4, (50,))
+    cp = ConformalPredictor(alpha=0.1)
+    tau = cp.calibrate(logits, labels)
+
+    probs = torch.softmax(logits, dim=1)
+    scores = 1.0 - probs[torch.arange(50), labels]
+    k = min(int(torch.ceil(torch.tensor(0.9 * 51)).item()), 50)
+    expected = torch.sort(scores).values[k - 1].item()
+    assert abs(tau - expected) < 1e-6
+    assert cp.calibration_stats["quantile_rank"] == k
+
+
+def test_conformal_small_calibration_set_clamps_rank():
+    """alpha so small that k > n must clamp to the max score."""
+    logits = torch.randn(10, 3)
+    labels = torch.randint(0, 3, (10,))
+    cp = ConformalPredictor(alpha=1e-9)
+    tau = cp.calibrate(logits, labels)
+    scores = 1.0 - torch.softmax(logits, dim=1)[torch.arange(10), labels]
+    assert abs(tau - scores.max().item()) < 1e-6

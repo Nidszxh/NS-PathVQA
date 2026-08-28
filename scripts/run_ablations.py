@@ -1,78 +1,50 @@
-import os
+"""Run the A–E ablation matrix end to end (train + evaluate each variant).
+
+Each variant gets its own checkpoint directory and its result is consolidated
+into a single JSON artifact (kept even for failed runs).
+"""
+
 import sys
-import subprocess
+import json
 import argparse
 from pathlib import Path
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Run Ablations (Phase E)")
+    parser = argparse.ArgumentParser(description="Run the A–E ablation matrix")
     parser.add_argument("--debug", action="store_true", help="Run in debug mode (fast)")
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Aggregate results artifact (default: outputs/ablation_results[_debug].json)",
+    )
     args = parser.parse_args()
 
-    # The 5 Ablation configurations as per NOVELTIES.md matrix:
-    # A (baseline): Regex | Hard-coded | Static
-    # B (current SOTA): Regex | Hard-coded | Learned
-    # C (differentiable): Learned | Differentiable | Learned
-    # D (no gate): Learned | Differentiable | Static (no-gate implies fallback to static weighting)
-    # E (regex + diff exec): Regex | Differentiable | Learned
-
-    ablations = {
-        "A_baseline": {
-            "query_parser": "regex",
-            "executor": "hard",
-            "weighting_strategy": "static"
-        },
-        "B_sota": {
-            "query_parser": "regex",
-            "executor": "hard",
-            "weighting_strategy": "learned"
-        },
-        "C_differentiable": {
-            "query_parser": "learned",
-            "executor": "differentiable",
-            "weighting_strategy": "learned"
-        },
-        "D_no_gate": {
-            "query_parser": "learned",
-            "executor": "differentiable",
-            "weighting_strategy": "static"
-        },
-        "E_regex_diffexec": {
-            "query_parser": "regex",
-            "executor": "differentiable",
-            "weighting_strategy": "learned"
-        }
-    }
-
-    print(f"Starting Ablation runs... (Debug: {args.debug})")
-
-    # To run programmatically, we can generate a config JSON for each and pass to train.py
-    # Since train.py does not currently support --config directly as an argument for overriding all properties easily without a JSON file, 
-    # we will generate a config JSON and invoke train.py (assuming we can pass config or we just override it in a script).
-    # Wait, train.py does not have a --config argument! It uses `get_default_config()` or `get_debug_config()`.
-    # Let's import train and evaluate directly to run them in process.
-
-    # Modify sys.path so we can import train.py and evaluate.py
+    # Make repo-root imports (train.py, evaluate.py) work when launched
+    # as `python scripts/run_ablations.py`.
     repo_root = Path(__file__).parent.parent
     sys.path.insert(0, str(repo_root))
-    sys.path.insert(0, str(repo_root / "src"))
 
     import train
     import evaluate
     from pathvqa.utils.config import get_default_config, get_debug_config
+    from pathvqa.utils.ablation import ABLATION_CONFIGS, ABLATION_LABELS, ABLATION_CHOICES
 
+    print(f"Starting Ablation runs... (Debug: {args.debug})")
     results = {}
 
-    for name, config_overrides in ablations.items():
-        print(f"\n{'='*50}\nRunning Ablation: {name}\n{'='*50}")
-        
+    for key in ABLATION_CHOICES:
+        label = ABLATION_LABELS[key]
+        name = f"{key}_{label}"
+        print(f"\n{'=' * 50}\nRunning Ablation: {name}\n{'=' * 50}")
+
         cfg = get_debug_config() if args.debug else get_default_config()
         cfg.experiment_name = f"ablation_{name}"
-        
-        cfg.symbolic.query_parser = config_overrides["query_parser"]
-        cfg.symbolic.executor = config_overrides["executor"]
-        cfg.symbolic.weighting_strategy = config_overrides["weighting_strategy"]
-        
+
+        # Overrides must be applied before Trainer builds the model.
+        evaluate.apply_ablation(cfg, key)
+
         # Adjust checkpoint directory so they don't overwrite each other
         base_dir = "checkpoints/debug" if args.debug else "checkpoints"
         ckpt_dir = Path(base_dir) / name
@@ -87,37 +59,61 @@ def main():
             trainer.train()
         except Exception as e:
             print(f"[{name}] Training failed: {e}")
-            results[name] = "FAILED"
+            results[name] = {"status": "FAILED", "error": str(e)}
             continue
 
         # 2. Evaluate
         print(f"[{name}] Starting Evaluation...")
         try:
-            # We use evaluate.py's Evaluator on the best checkpoint
+            # Evaluator rebuilds from the checkpoint's saved config, which
+            # already carries this ablation's symbolic overrides.
             if not cfg.paths.best_model_path.exists():
                 print(f"[{name}] Checkpoint not found at {cfg.paths.best_model_path}")
-                results[name] = "NO_CHECKPOINT"
+                results[name] = {"status": "NO_CHECKPOINT"}
                 continue
 
-            # Need to save the config as json so Evaluator can load it, or just pass it in?
-            # Evaluator loads from checkpoint's config, so we just pass the checkpoint path
             evaluator = evaluate.Evaluator(checkpoint_path=str(cfg.paths.best_model_path))
-            # evaluate on val split
-            acc, per_type = evaluator.evaluate(split="val", max_samples=cfg.data.max_val_samples)
-            results[name] = acc
-            print(f"[{name}] Validation Accuracy: {acc:.2f}%")
+            r = evaluator.evaluate(split="val", max_samples=cfg.data.max_val_samples)
+            results[name] = {
+                "status": "OK",
+                "ablation": key,
+                "label": label,
+                "accuracy": r["accuracy"],
+                "per_type_accuracy": r.get("per_type_accuracy", {}),
+            }
+            print(f"[{name}] Validation Accuracy: {r['accuracy']:.2f}%")
         except Exception as e:
             print(f"[{name}] Evaluation failed: {e}")
-            results[name] = "EVAL_FAILED"
+            results[name] = {"status": "EVAL_FAILED", "error": str(e)}
 
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("Ablation Results Summary")
-    print("="*50)
-    for name, acc in results.items():
-        if isinstance(acc, float):
-            print(f"{name}: {acc:.2f}%")
+    print("=" * 50)
+    for name, res in results.items():
+        if res.get("status") == "OK":
+            print(f"{name}: {res['accuracy']:.2f}%")
         else:
-            print(f"{name}: {acc}")
+            print(f"{name}: {res['status']}")
+
+    # Persist a consolidated artifact so results survive process exit,
+    # including failed runs.
+    out_path = args.output
+    if out_path is None:
+        suffix = "_debug" if args.debug else ""
+        out_path = str(Path("outputs") / f"ablation_results{suffix}.json")
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(
+            {
+                "debug": args.debug,
+                "matrix": ABLATION_CONFIGS,
+                "labels": ABLATION_LABELS,
+                "results": results,
+            },
+            f,
+            indent=2,
+        )
+    print(f"Aggregate results saved to {out_path}")
 
 
 if __name__ == "__main__":

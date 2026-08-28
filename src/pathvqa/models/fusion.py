@@ -10,12 +10,21 @@ class CrossModalTransformer(nn.Module):
     Output is (batch, hidden_dim), consumed by the neural classifier and SceneParser.
     """
 
-    def __init__(self, text_dim: int = 768, visual_dim: int = 512,
-                 hidden_dim: int = 512, num_heads: int = 8, dropout: float = 0.3):
+    def __init__(
+        self,
+        text_dim: int = 768,
+        visual_dim: int = 512,
+        hidden_dim: int = 512,
+        num_heads: int = 8,
+        dropout: float = 0.3,
+    ):
+        """Build the Q/K/V projections, output projection, and feed-forward block."""
         super().__init__()
+        if hidden_dim % num_heads != 0:
+            raise ValueError(f"hidden_dim ({hidden_dim}) must be divisible by num_heads ({num_heads})")
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
 
         self.q_proj = nn.Linear(text_dim, hidden_dim)
         self.k_proj = nn.Linear(visual_dim, hidden_dim)
@@ -31,8 +40,9 @@ class CrossModalTransformer(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, question_state: torch.Tensor, visual_features: torch.Tensor,
-                mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, question_state: torch.Tensor, visual_features: torch.Tensor, mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend over visual features given a question state. Returns (attended, weights)."""
         batch = question_state.size(0)
         num_objects = visual_features.size(1)
@@ -42,22 +52,21 @@ class CrossModalTransformer(nn.Module):
         k = self.k_proj(visual_features).view(batch, num_objects, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(visual_features).view(batch, num_objects, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Attention scores: QK^T / sqrt(d_k)
+        # QK^T / sqrt(d_k), then mask padded patches with dtype-min so the
+        # softmax below yields exactly zero there under fp16.
         scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        # FP16-safe: mask with dtype min before softmax.
         scores = scores.masked_fill(~mask[:, None, None, :], torch.finfo(scores.dtype).min)
-        # Multi-head attention: softmax(scores) @ V → reshape → out_proj
         weights = torch.softmax(scores, dim=-1)
         attended = torch.matmul(weights, v).transpose(1, 2)  # (B, 1, H, head_dim)
         attended = attended.reshape(batch, self.head_dim * self.num_heads)
         attended = self.out_proj(attended)
         attended = self.norm(self.dropout(attended))
         out = attended + self.ffn(attended)
-        
-        # Shape assertions (P4)
+
+        # Downstream heads scatter-add over exactly these dimensions.
         assert out.shape == (batch, self.head_dim * self.num_heads)
         assert weights.shape == (batch, self.num_heads, 1, num_objects)
-        
+
         return out, weights
 
 

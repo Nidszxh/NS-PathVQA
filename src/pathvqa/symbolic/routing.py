@@ -1,27 +1,36 @@
 """Learned confidence gate for neuro-symbolic fusion.
 
-Computes g = σ(MLP([h_attn ‖ c_scene ‖ onehot(qtype)])), blending:
-  final = (1-g) * neural_logits + g * symbolic_logits
+Computes g = σ(MLP([h_attn ‖ c_scene ‖ onehot(qtype) ‖ ent(attn)])). The gate
+values weight the Product-of-Experts fusion in *log-probability* space:
 
-When weighting_strategy="static", a fixed weight is used instead.
+    log p = (1 - g) · log p_neural + g · log p_symbolic
+
+(see ``pathvqa.symbolic.poe``). When weighting_strategy="static", a fixed
+weight is used instead of the gate.
 """
 
 import torch
 import torch.nn as nn
-from typing import Dict
+from typing import Any, Dict, List, Optional
 
 QTYPE_LIST = ["identity", "location", "yes_no", "attribute", "count"]
 QTYPE_TO_IDX = {q: i for i, q in enumerate(QTYPE_LIST)}
 NUM_QTYPES = len(QTYPE_LIST)
 
 
-def encode_question_types(questions: list) -> torch.Tensor:
-    """Encode question strings into one-hot qtype tensors (B, NUM_QTYPES)."""
-    from pathvqa.symbolic.query_parser import parse_question
+def encode_question_types(questions: List[Any]) -> torch.Tensor:
+    """Encode questions into one-hot qtype tensors (B, NUM_QTYPES).
+
+    Accepts raw question strings or pre-parsed ``Query`` objects (the PoE
+    fusion engine passes already-parsed queries; re-parsing a ``Query`` would
+    crash on ``Query.lower``).
+    """
+    from pathvqa.symbolic.query_parser import Query, parse_question
+
     batch_size = len(questions)
     onehot = torch.zeros(batch_size, NUM_QTYPES)
     for i, q in enumerate(questions):
-        parsed = parse_question(q)
+        parsed = q if isinstance(q, Query) else parse_question(q)
         idx = QTYPE_TO_IDX.get(parsed.qtype, 0)
         onehot[i, idx] = 1.0
     return onehot
@@ -30,12 +39,14 @@ def encode_question_types(questions: list) -> torch.Tensor:
 def attn_entropy(weights: torch.Tensor) -> torch.Tensor:
     """Compute entropy of attention distribution: ent(attn) = -Σ p log p.
 
-    Handles (B, H, 1, N) or (B, N) shapes. Returns (B, 1).
+    Accepts (B, H, 1, N), (B, H, N), or (B, N); heads are averaged down to
+    (B, N) before normalizing. Returns (B, 1).
     """
     if weights.dim() == 4:
-        # (B, H, 1, N) → mean over heads → (B, N)
+        # (B, H, 1, N) → mean over heads → squeeze the singleton query dim
         p = weights.mean(dim=1).squeeze(1)
     elif weights.dim() == 3:
+        # (B, H, N) → mean over heads
         p = weights.mean(dim=1)
     else:
         p = weights
@@ -52,11 +63,17 @@ class LearnedGate(nn.Module):
       g = σ(MLP([h_attn ‖ c_scene ‖ onehot(qtype) ‖ ent(attn)]))
     """
 
-    def __init__(self, visual_dim: int = 512, num_regions: int = 50,
-                 num_qtypes: int = NUM_QTYPES, dropout: float = 0.1):
+    def __init__(
+        self, visual_dim: int = 512, num_regions: int = 50, num_qtypes: int = NUM_QTYPES, dropout: float = 0.1
+    ):
+        """Build the gate MLP over the concatenated [h_attn ‖ c_scene ‖ qtype ‖ entropy] vector.
+
+        ``num_regions`` is accepted for signature compatibility with the other
+        symbolic components but is not an input to the gate, which scores a
+        single global ``c_scene`` value rather than per-region evidence.
+        """
         super().__init__()
-        # [h_attn ‖ c_scene ‖ onehot(qtype) ‖ ent(attn)]
-        # c_scene is always (B, 1) — max over regions
+        # c_scene is always (B, 1) — max over regions, so it adds 1 to the width
         gate_input_dim = visual_dim + 1 + num_qtypes + 1
         self.gate_mlp = nn.Sequential(
             nn.Linear(gate_input_dim, 128),
@@ -65,9 +82,13 @@ class LearnedGate(nn.Module):
             nn.Linear(128, 1),
         )
 
-    def forward(self, h_attn: torch.Tensor, c_scene: torch.Tensor,
-                qtype_onehot: torch.Tensor,
-                attn_weights: torch.Tensor = None) -> torch.Tensor:
+    def forward(
+        self,
+        h_attn: torch.Tensor,
+        c_scene: torch.Tensor,
+        qtype_onehot: torch.Tensor,
+        attn_weights: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Compute gate values. Returns (batch, 1) in [0, 1]."""
         batch_size = h_attn.size(0)
         device = h_attn.device
@@ -77,14 +98,16 @@ class LearnedGate(nn.Module):
         else:
             ent = torch.zeros(batch_size, 1, device=device, dtype=dtype)
 
-        # g = σ(MLP([h_attn ‖ c_scene ‖ onehot(qtype) ‖ ent(attn)]))
         gate_input = torch.cat([h_attn, c_scene, qtype_onehot, ent], dim=-1)
         return torch.sigmoid(self.gate_mlp(gate_input))
 
-    def get_mean_gate_per_qtype(self, h_attn: torch.Tensor,
-                                c_scene: torch.Tensor,
-                                qtype_onehot: torch.Tensor,
-                                attn_weights: torch.Tensor = None) -> Dict[str, float]:
+    def get_mean_gate_per_qtype(
+        self,
+        h_attn: torch.Tensor,
+        c_scene: torch.Tensor,
+        qtype_onehot: torch.Tensor,
+        attn_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, float]:
         """Mean gate value per question type (for logging)."""
         g = self.forward(h_attn, c_scene, qtype_onehot, attn_weights)  # (batch, 1)
         result = {}
