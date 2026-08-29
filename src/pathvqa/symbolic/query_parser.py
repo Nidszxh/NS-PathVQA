@@ -47,19 +47,34 @@ ATTRIBUTE_PATTERNS = {
 
 
 def _extract_target(question: str, answer_vocab: List[str]) -> str:
-    """Find the most specific word/phrase from the question in the answer vocabulary."""
+    """Find the most specific word/phrase from the question in the answer vocabulary.
+
+    Region words are preferred over longer non-region words: "is there
+    malignant lung?" must target ``lung`` (the only entity with a presence
+    head), not ``malignant``. Preferring the longest token there would suppress
+    otherwise-valid symbolic evidence.
+    """
     q = question.lower()
     words = {str(w) for w in re.findall(r"\b[a-z]+\b", q)}
     # Deterministic tie-break: equal-length words must not depend on set/hash order
-    for word in sorted(words, key=lambda w: (-len(w), w)):
-        if word in answer_vocab:
-            return word
+    word_matches = [word for word in sorted(words, key=lambda w: (-len(w), w)) if word in answer_vocab]
+    phrase_matches: List[str] = []
     for phrase_len in range(4, 0, -1):
         for i in range(len(q.split()) - phrase_len + 1):
             phrase = " ".join(q.split()[i : i + phrase_len])
             if phrase in answer_vocab:
-                return phrase
-    return ""
+                phrase_matches.append(phrase)
+    candidates = word_matches + phrase_matches
+    if not candidates:
+        return ""
+
+    # Imported lazily: ``executor`` imports this module at load time.
+    from pathvqa.symbolic.executor import _is_region_answer
+
+    for candidate in candidates:
+        if _is_region_answer(candidate):
+            return candidate
+    return candidates[0]
 
 
 def parse_question(question: str, answer_vocab: Optional[List[str]] = None) -> Query:

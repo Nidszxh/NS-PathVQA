@@ -7,7 +7,7 @@ extractor.
 """
 
 import torch
-from typing import Dict, List
+from typing import Dict, List, Optional
 from pathvqa.symbolic.executor import build_region_mapping, build_attribute_mappings
 
 
@@ -33,7 +33,11 @@ class DifferentiableExecutor:
         self.no_idx = answer_to_idx.get("no", -1)
 
     def execute(
-        self, scene_logits: Dict[str, torch.Tensor], soft_qtype: torch.Tensor, soft_target: torch.Tensor
+        self,
+        scene_logits: Dict[str, torch.Tensor],
+        soft_qtype: torch.Tensor,
+        soft_target: torch.Tensor,
+        yes_no_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Blend the qtype branches into symbolic answer logits.
 
@@ -46,6 +50,12 @@ class DifferentiableExecutor:
             scene_logits: Scene-head outputs keyed by tensor name.
             soft_qtype: (B, 5) probabilities over the five qtypes.
             soft_target: (B, num_regions) target-region probabilities.
+            yes_no_valid: Optional (B,) boolean mask marking rows whose target
+                is an actual region. Rows marked False emit no yes/no evidence,
+                mirroring the hard executor. When omitted, validity is inferred
+                from target concentration (a uniform distribution carries no
+                region-specific presence evidence); a one-region vocabulary is
+                treated as valid because every distribution is trivially sharp.
 
         Returns:
             (B, vocab_size) symbolic logits.
@@ -70,8 +80,8 @@ class DifferentiableExecutor:
             ident_logits.scatter_add_(1, idx_expanded, gathered)
 
         # 2. Yes/No branch (Index 2)
-        # Use the calibrated presence probability (sigmoid output) rather than
-        # the sign of an uncalibrated multi-class region logit.
+        # Use the BCE-trained sigmoid presence score rather than the sign of a
+        # multi-class region logit. The score is not post-hoc calibrated.
         yn_logits = torch.zeros(batch_size, self.vocab_size, device=device)
         if self.yes_idx >= 0 and self.no_idx >= 0:
             presence = scene_logits.get("scene_object_presence")
@@ -83,6 +93,24 @@ class DifferentiableExecutor:
             else:
                 # Fallback: no presence head available.
                 yes_score = (target * region_logits).sum(dim=1)
+
+            # A yes/no question about a non-region target has no presence head
+            # (the hard executor emits no evidence for it). Without this mask
+            # the soft target's uniform fallback would manufacture a
+            # "is any region present?" proxy answer.
+            if yes_no_valid is not None:
+                valid = yes_no_valid.to(device=device, dtype=torch.bool).reshape(-1)
+                if valid.numel() != batch_size:
+                    raise ValueError(f"yes_no_valid has {valid.numel()} entries but batch size is {batch_size}")
+            elif soft_target.size(1) <= 1:
+                # Every distribution over a single region is "uniform"; there is
+                # no ambiguity to detect, so keep the evidence.
+                valid = torch.ones(batch_size, dtype=torch.bool, device=device)
+            else:
+                chance = 1.0 / soft_target.size(1)
+                valid = soft_target.max(dim=1).values > chance
+            yes_score = yes_score * valid.to(yes_score.dtype)
+
             yn_logits[:, self.yes_idx] = yes_score.to(yn_logits.dtype)
             yn_logits[:, self.no_idx] = -yes_score.to(yn_logits.dtype)
 

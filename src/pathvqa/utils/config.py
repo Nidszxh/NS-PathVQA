@@ -124,6 +124,10 @@ class SymbolicConfig:
     qtype_warmup_epochs: int = 3
     # Cross-entropy weight applied to the learned qtype classifier during warmup.
     qtype_warmup_weight: float = 0.1
+    # Weak text-derived region-target supervision for the learned target head.
+    target_loss_weight: float = 0.1
+    # Include an explicit no-region target so learned routing can abstain.
+    target_no_region_class: bool = True
 
     def __post_init__(self) -> None:
         if isinstance(self.region_names, list):
@@ -226,14 +230,28 @@ def validate_config(cfg: Config) -> None:
         raise ValueError(f"grad_accum_steps must be >= 1, got {cfg.training.grad_accum_steps}")
     if not (0.0 <= cfg.training.ema_decay < 1.0):
         raise ValueError(f"ema_decay must be in [0, 1), got {cfg.training.ema_decay}")
-    if cfg.symbolic.enabled and cfg.symbolic.symbolic_weight < 0:
-        raise ValueError(f"symbolic_weight must be >= 0, got {cfg.symbolic.symbolic_weight}")
+    if cfg.symbolic.enabled and not (0.0 <= cfg.symbolic.symbolic_weight <= 1.0):
+        raise ValueError(f"symbolic_weight must be in [0, 1] (it is the PoE gate), got {cfg.symbolic.symbolic_weight}")
     if cfg.symbolic.query_parser not in ("regex", "learned"):
         raise ValueError(f"Unknown query parser: {cfg.symbolic.query_parser!r}")
     if cfg.symbolic.executor not in ("hard", "differentiable"):
         raise ValueError(f"Unknown executor: {cfg.symbolic.executor!r}")
     if cfg.symbolic.weighting_strategy not in ("static", "learned"):
         raise ValueError(f"Unknown weighting strategy: {cfg.symbolic.weighting_strategy!r}")
+    if cfg.symbolic.qtype_warmup_epochs < 0:
+        raise ValueError(f"qtype_warmup_epochs must be >= 0, got {cfg.symbolic.qtype_warmup_epochs}")
+    if cfg.symbolic.qtype_warmup_weight < 0 or cfg.symbolic.target_loss_weight < 0:
+        raise ValueError("query parser supervision weights must be non-negative")
+    if not (0.0 < cfg.symbolic.conformal_alpha < 1.0):
+        raise ValueError(f"conformal_alpha must be in (0, 1), got {cfg.symbolic.conformal_alpha}")
+    if cfg.symbolic.conformal_max_set_size < 1:
+        raise ValueError(f"conformal_max_set_size must be >= 1, got {cfg.symbolic.conformal_max_set_size}")
+    if cfg.training.num_epochs < 1:
+        raise ValueError(f"num_epochs must be >= 1, got {cfg.training.num_epochs}")
+    if cfg.data.batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {cfg.data.batch_size}")
+    if len(cfg.data.image_size) != 2 or min(cfg.data.image_size) < 1:
+        raise ValueError(f"image_size must be a positive (height, width) pair, got {cfg.data.image_size}")
 
 
 def backfill_config(cfg: Config) -> Config:
@@ -261,6 +279,10 @@ def backfill_config(cfg: Config) -> Config:
             missing = [f.name for f in fields(default_sub) if not hasattr(sub, f.name)]
         for name in missing:
             setattr(sub, name, getattr(default_sub, name))
+        if sub_name == "symbolic" and "target_no_region_class" in missing:
+            # Older learned-target checkpoints have a num_regions-wide head.
+            # Keep that saved architecture when backfilling old configs.
+            sub.target_no_region_class = False
         if hasattr(sub, "__post_init__"):
             sub.__post_init__()
 

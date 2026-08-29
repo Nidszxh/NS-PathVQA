@@ -9,6 +9,7 @@ from pathvqa.data.pathvqa_dataset import (
     ImageCache,
     IMAGENET_MEAN,
     IMAGENET_STD,
+    get_normalize,
 )
 from PIL import Image
 import torch
@@ -149,3 +150,8 @@ def test_image_cache_atomic_write(tmp_path):
 def test_imagenet_stats_unchanged():
     assert IMAGENET_MEAN == [0.485, 0.456, 0.406]
     assert IMAGENET_STD == [0.229, 0.224, 0.225]
+
+
+def test_unknown_normalization_is_rejected():
+    with pytest.raises(ValueError, match="expected 'clip' or 'imagenet'"):
+        get_normalize("typo")

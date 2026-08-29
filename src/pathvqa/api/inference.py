@@ -5,6 +5,7 @@ preprocessing (base64 → CLIP-normalized tensor) matching the training pipeline
 """
 
 import base64
+import binascii
 import dataclasses
 import io
 import logging
@@ -14,7 +15,7 @@ import PIL.Image
 import torch
 
 
-from pathvqa.data.pathvqa_dataset import get_clip_normalize, resize_keep_aspect
+from pathvqa.data.pathvqa_dataset import get_normalize, resize_keep_aspect
 from pathvqa.models.pathvqa_model import build_model
 from pathvqa.models.question.question_encoder import get_question_tokenizer
 from pathvqa._compat import is_pre_dsl_checkpoint, migrate_legacy_scene_head
@@ -30,6 +31,9 @@ from pathvqa.data.dataset_adapter import AnatomicalOntology
 from pathvqa.utils.config import backfill_config
 
 logger = logging.getLogger(__name__)
+
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_IMAGE_PIXELS = 4096 * 4096
 
 
 class PathVQAInference:
@@ -71,6 +75,29 @@ class PathVQAInference:
 
         if not self.region_names:
             self.region_names = build_region_names(self.answer_vocab)
+        # The scene-head width stored in the weights is ground truth. A stale
+        # config.symbolic.num_regions (or a mismatched region-name list) would
+        # otherwise build a differently shaped scene parser and fail later with
+        # an opaque state_dict shape error.
+        state_key = "ema_state_dict" if ckpt.get("ema_state_dict") else "model_state_dict"
+        eval_state, removed = migrate_legacy_scene_head(ckpt[state_key])
+        if removed:
+            logger.warning(f"Dropping {len(removed)} legacy density-head params from checkpoint")
+        region_weight = eval_state.get("scene_parser.region_classifier.weight")
+        if isinstance(region_weight, torch.Tensor):
+            head_regions = int(region_weight.shape[0])
+            if self.config.symbolic.num_regions != head_regions:
+                logger.warning(
+                    "Checkpoint scene head has %d regions but config says %d; using the checkpoint value",
+                    head_regions,
+                    self.config.symbolic.num_regions,
+                )
+                self.config.symbolic.num_regions = head_regions
+            if self.region_names and len(self.region_names) != head_regions:
+                raise ValueError(
+                    f"Checkpoint region_names has {len(self.region_names)} entries but the scene head "
+                    f"predicts {head_regions} regions; refusing to serve misaligned region scores"
+                )
         self.region_to_answer_idx = build_region_mapping(self.region_names, self.answer_to_idx).to(self.device)
         self.attribute_mappings = build_attribute_mappings(self.answer_to_idx)
         self.ontology = AnatomicalOntology(getattr(self.config.symbolic, "ontology_path", None))
@@ -85,13 +112,11 @@ class PathVQAInference:
 
         # Tokenizer & model
         self.tokenizer = get_question_tokenizer(self.config.question.model_name)
-        self.model = build_model(self.config, len(self.answer_vocab))
-        if ckpt.get("ema_state_dict") is not None:
-            ema_state, _ = migrate_legacy_scene_head(ckpt["ema_state_dict"])
-            self.model.load_state_dict(ema_state)
-        else:
-            model_state, _ = migrate_legacy_scene_head(ckpt["model_state_dict"])
-            self.model.load_state_dict(model_state)
+        # Pass the attribute mappings so the DSL interpreter is built with the
+        # same heads as training/evaluation (build_model otherwise falls back to
+        # an empty mapping and the QueryAttr branch silently disables itself).
+        self.model = build_model(self.config, len(self.answer_vocab), self.attribute_mappings)
+        self.model.load_state_dict(eval_state)
         self.model.to(self.device)
         self.model.eval()
 
@@ -111,16 +136,30 @@ class PathVQAInference:
             attribute_mappings=self.attribute_mappings,
         )
 
-        # Preprocessing
-        self._normalize = get_clip_normalize()
+        # Preprocessing: use the normalization the checkpoint was trained with.
+        self._normalize = get_normalize(self.config.data.norm)
         self._resize: Callable[[Any], Any] = lambda img: resize_keep_aspect(img, self.config.data.image_size)
 
     def _preprocess_image(self, image_b64: str) -> torch.Tensor:
         """Decode base64 image → CLIP-normalized (1, 3, H, W) tensor."""
         import torchvision.transforms.functional as TF
 
-        img_bytes = base64.b64decode(image_b64)
-        pil_image = PIL.Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        try:
+            img_bytes = base64.b64decode(image_b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("image_base64 must contain valid base64 data") from exc
+        if len(img_bytes) > MAX_IMAGE_BYTES:
+            raise ValueError(f"decoded image exceeds the {MAX_IMAGE_BYTES // (1024 * 1024)} MiB limit")
+
+        try:
+            with PIL.Image.open(io.BytesIO(img_bytes)) as image:
+                if image.width * image.height > MAX_IMAGE_PIXELS:
+                    raise ValueError("image dimensions exceed the supported pixel limit")
+                image.load()
+                pil_image = image.convert("RGB")
+        except (PIL.UnidentifiedImageError, OSError) as exc:
+            raise ValueError("image_base64 does not contain a supported image") from exc
+
         resized = self._resize(pil_image)
         # TF comes from a module without type stubs; pin the result explicitly.
         tensor: torch.Tensor = TF.pil_to_tensor(resized).to(self.device)  # uint8 (3, H, W)
@@ -155,16 +194,19 @@ class PathVQAInference:
 
         with torch.autocast(device_type=self.device.type, enabled=self.amp_enabled):
             outputs = self.model(images, input_ids, attn_mask, qtype_onehot)
-
-        combined, _ = self._compute_symbolic(outputs, [question])
+            combined, exec_trace = self._compute_symbolic(outputs, [question])
         probs = torch.softmax(combined, dim=-1)
         conf, pred_idx = probs.max(dim=-1)
         answer = self.idx_to_answer[pred_idx.item()]
+        # The executed qtype is the learned parser's decision when that parser
+        # is active; falling back to the regex label avoids claiming a parser
+        # the model did not run.
+        executed_qtype = (exec_trace.get("qtypes") or [qtype])[0]
 
         return {
             "answer": answer,
             "confidence": round(conf.item(), 4),
-            "question_type": qtype,
+            "question_type": executed_qtype,
         }
 
     @torch.no_grad()
@@ -180,11 +222,12 @@ class PathVQAInference:
 
         with torch.autocast(device_type=self.device.type, enabled=self.amp_enabled):
             outputs = self.model(images, input_ids, attn_mask, qtype_onehot)
-
-        combined, exec_trace = self._compute_symbolic(outputs, [question])
+            combined, exec_trace = self._compute_symbolic(outputs, [question])
         probs = torch.softmax(combined, dim=-1)
         conf, pred_idx = probs.max(dim=-1)
         answer = self.idx_to_answer[pred_idx.item()]
+        executed_qtype = (exec_trace.get("qtypes") or [query.qtype])[0]
+        symbolic_used = bool((exec_trace.get("symbolic_used") or [False])[0])
 
         # Build trace
         region_scores = None
@@ -241,7 +284,7 @@ class PathVQAInference:
         tree = generate_hierarchical_reasoning_tree(
             prediction=answer,
             confidence=conf.item(),
-            qtype=query.qtype,
+            qtype=executed_qtype,
             target=query.target,
             region_names=region_names_top or [],
             region_scores=region_scores or [],
@@ -251,12 +294,12 @@ class PathVQAInference:
         return {
             "answer": answer,
             "confidence": round(conf.item(), 4),
-            "question_type": query.qtype,
+            "question_type": executed_qtype,
             "trace": {
-                "question_type": query.qtype,
+                "question_type": executed_qtype,
                 "target": query.target,
                 "attribute": query.attribute,
-                "symbolic_used": bool(exec_trace.get("symbolic_used", [False]) and exec_trace["symbolic_used"][0]),
+                "symbolic_used": symbolic_used,
                 "region_scores": region_scores,
                 "region_names": region_names_top,
                 "grounding_boxes": grounding_boxes,

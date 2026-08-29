@@ -2,7 +2,7 @@
 
 For each query type:
   - identity/location: scatter_add region logits to matching answer indices
-  - yes_no: convert the calibrated object-presence probability to log-odds and
+  - yes_no: convert the BCE-trained object-presence score to log-odds and
     write it to the yes/no answers
   - attribute: scatter_add attribute logits to matching answers
   - count: no-op (neural handles counting)
@@ -113,12 +113,12 @@ def build_region_names(answer_vocab: List[str]) -> List[str]:
 
 
 def presence_log_odds(presence: torch.Tensor) -> torch.Tensor:
-    """Convert calibrated presence probabilities to log-odds.
+    """Convert sigmoid presence scores to log-odds-style evidence.
 
-    ``scene_object_presence`` is a sigmoid output, so it is a calibrated
-    presence probability (unlike multi-class region-classification logits,
-    whose sign carries no presence meaning). Clamping keeps the transform
-    finite at the saturated endpoints.
+    ``scene_object_presence`` is a dedicated sigmoid head trained with BCE;
+    its values are evidence scores and are not post-hoc calibrated
+    probabilities. Unlike multi-class region-classification logits, their sign
+    has presence semantics. Clamping keeps the transform finite at endpoints.
     """
     p = presence.clamp(min=1e-6, max=1.0 - 1e-6)
     return torch.log(p) - torch.log1p(-p)
@@ -253,7 +253,7 @@ def execute(
     yes_idx = answer_to_idx.get("yes")
     no_idx = answer_to_idx.get("no")
 
-    # Calibrated object-presence probability, accepted under either the
+    # Sigmoid object-presence score, accepted under either the
     # SceneParserOutput (``object_presence``) or ModelOutput
     # (``scene_object_presence``) naming convention.
     presence = getattr(scene_logits, "object_presence", None)
@@ -302,9 +302,9 @@ def execute(
                             max_conf = region_logits[i, :].max()
                             symbolic_logits[i, fallback_idx] = F.softplus(max_conf)
 
-    # Yes/No: use the calibrated object-presence probability as evidence.
-    # A multi-class region logit's sign does not encode presence, so we convert
-    # the sigmoid presence score to log-odds before routing it to yes/no.
+    # Yes/No: use the BCE-trained object-presence score as evidence.
+    # A multi-class region logit's sign does not encode presence, so use the
+    # dedicated sigmoid score and convert it to log-odds-style evidence.
     if is_yes_no.any():
         yn_indices = is_yes_no.nonzero(as_tuple=True)[0]
         for idx in yn_indices:
@@ -314,21 +314,19 @@ def execute(
 
             target_l = query.target.lower() if query.target else ""
             matches = [rn for rn in region_names if rn.lower() == target_l]
-            if target_l and matches:
-                r_idx = region_names.index(matches[0])
-                r_conf = presence[i, r_idx] if presence is not None else region_logits[i, r_idx]
-            elif query.target and query.target in answer_to_idx:
-                r_conf = presence[i, :].max() if presence is not None else region_logits[i, :].max()
-            else:
-                # No specific target — boost all region answers
-                for j, name in enumerate(region_names):
-                    if name in answer_to_idx:
-                        aidx = answer_to_idx[name]
-                        symbolic_logits[i, aidx] = symbolic_logits[i, aidx] + region_logits[i, j]
-                r_conf = presence[i, :].max() if presence is not None else region_logits[i, :].max()
+            if not (target_l and matches):
+                # The scene parser only has presence heads for its region
+                # vocabulary. A non-region target (e.g. "malignant") has no
+                # concept head, and the maximum over organ presence answers a
+                # different question ("is any organ present?"). Emit no
+                # evidence; the fusion engine then keeps the neural
+                # distribution for this row instead of consuming a proxy.
+                continue
+            r_idx = region_names.index(matches[0])
+            r_conf = presence[i, r_idx] if presence is not None else region_logits[i, r_idx]
 
-            # Yes/no: positive log-odds -> yes, negative -> no. Both classes are
-            # written so the softmax over symbolic logits is calibrated.
+            # Yes/no: positive log-odds-style evidence -> yes, negative -> no.
+            # These remain symbolic scores; they are not calibrated posteriors.
             if presence is not None:
                 evidence = presence_log_odds(r_conf)
             else:
@@ -354,8 +352,10 @@ def execute(
                     target_indices = mapping[valid_attr_mask]
                     symbolic_logits[i, target_indices] = attr_logits[i, valid_attr_mask]
 
-    # Build trace: count (4) is the only non-symbolic type
-    symbolic_used = (qtype_ids != 4).tolist()
+    # Build trace from the evidence actually written. Count rows are no-ops,
+    # and a branch selected for a row may still write nothing (non-region
+    # yes/no target, unknown identity target, missing attribute mapping).
+    symbolic_used = [bool(torch.count_nonzero(symbolic_logits[i]).item()) for i in range(batch_size)]
 
     return ExecutorOutput(
         symbolic_logits=symbolic_logits,

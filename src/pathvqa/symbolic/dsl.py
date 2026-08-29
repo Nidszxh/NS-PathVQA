@@ -7,6 +7,8 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 
+_DSL_LOGIT_FLOOR = -30.0
+
 
 # Coarse directional priors over a normalized patch grid, expressed as offsets
 # in [x, y] (right, down). Used to give ``Relate`` a genuine (if simple) spatial
@@ -21,6 +23,24 @@ RELATION_DIRECTION_OFFSETS: Dict[str, Tuple[float, float]] = {
     "above": (0.0, -1.0),
     "below": (0.0, 1.0),
 }
+
+_RELATION_PATTERNS: Tuple[Tuple[str, str], ...] = (
+    ("left_of", r"\b(?:to the )?left of\b"),
+    ("right_of", r"\b(?:to the )?right of\b"),
+    ("above", r"\b(?:above|superior to)\b"),
+    ("below", r"\b(?:below|inferior to|underneath)\b"),
+    ("inside", r"\b(?:inside|within)\b"),
+    ("near", r"\b(?:near|adjacent to|next to)\b"),
+)
+
+
+def _infer_spatial_relation(question: str) -> str:
+    """Extract only explicit spatial relations; otherwise use ``located_in``."""
+    normalized = question.lower()
+    for relation, pattern in _RELATION_PATTERNS:
+        if re.search(pattern, normalized):
+            return relation
+    return "located_in"
 
 
 def _relation_patch_weights(relation: str, num_patches: int, device: torch.device) -> torch.Tensor:
@@ -46,6 +66,60 @@ def _relation_patch_weights(relation: str, num_patches: int, device: torch.devic
     alignment = alignment.clamp(min=1e-3)
     normalized: torch.Tensor = alignment / alignment.sum()
     return normalized
+
+
+NUMBER_WORDS: Dict[str, float] = {
+    "zero": 0.0,
+    "one": 1.0,
+    "two": 2.0,
+    "three": 3.0,
+    "four": 4.0,
+    "five": 5.0,
+    "six": 6.0,
+    "seven": 7.0,
+    "eight": 8.0,
+    "nine": 9.0,
+    "ten": 10.0,
+    "eleven": 11.0,
+    "twelve": 12.0,
+    "thirteen": 13.0,
+    "fourteen": 14.0,
+    "fifteen": 15.0,
+    "sixteen": 16.0,
+    "seventeen": 17.0,
+    "eighteen": 18.0,
+    "nineteen": 19.0,
+    "twenty": 20.0,
+}
+
+# Qualitative quantity answers mapped to a representative numeric value.
+QUALITATIVE_COUNTS: Dict[str, float] = {
+    "few": 3.0,
+    "several": 4.0,
+    "multiple": 8.0,
+    "many": 10.0,
+    "numerous": 10.0,
+}
+
+
+def count_answer_values(answer_to_idx: Dict[str, int]) -> Dict[str, float]:
+    """Map answer-vocabulary strings to numeric count values.
+
+    Derived from the vocabulary instead of a fixed list: PathVQA count answers
+    include digits (``"1"``, ``"9"``), number words beyond three (``"four"``,
+    ``"six"``) and qualitative quantities (``"few"``, ``"numerous"``). A fixed
+    ``1..5`` map silently made those answers unreachable for the DSL branch.
+    """
+    values: Dict[str, float] = {}
+    for answer in answer_to_idx:
+        normalised = answer.lower().strip()
+        if normalised in NUMBER_WORDS:
+            values[answer] = NUMBER_WORDS[normalised]
+        elif normalised.isdigit() and len(normalised) <= 3:
+            values[answer] = float(int(normalised))
+        elif normalised in QUALITATIVE_COUNTS:
+            values[answer] = QUALITATIVE_COUNTS[normalised]
+    return values
 
 
 @dataclass
@@ -94,7 +168,7 @@ class DSLProgramCompiler:
         elif qtype in ("location", "relate"):
             return DSLNode(
                 op="Relate",
-                args={"relation": "located_in", "target": target},
+                args={"relation": _infer_spatial_relation(q), "target": target},
                 child=DSLNode(op="Filter", args={"concept": target or "tissue"}),
             )
         else:  # identity
@@ -152,70 +226,74 @@ class DifferentiableDSLInterpreter(nn.Module):
             per_patch = count_scores * patch_weights
             soft_count = per_patch.sum(dim=1).squeeze(-1)  # (B,)
 
-            # Map soft count to common discrete count answers in medical VQA
-            count_map = {
-                "1": 1.0,
-                "2": 2.0,
-                "3": 3.0,
-                "4": 4.0,
-                "5": 5.0,
-                "one": 1.0,
-                "two": 2.0,
-                "three": 3.0,
-                "few": 3.0,
-                "multiple": 8.0,
-                "many": 10.0,
-            }
-            for ans_str, val in count_map.items():
-                if ans_str in answer_to_idx:
+            # Candidate count answers come from the vocabulary itself (digits,
+            # number words, qualitative quantities). The interpreter emits
+            # *log* evidence because the fusion engine applies log_softmax to
+            # the symbolic logits. Writing raw similarities in [0, 1] would
+            # make every non-count class (left at zero) outrank the predicted
+            # count and invert the signal.
+            count_map = count_answer_values(answer_to_idx)
+            if count_map:
+                logits[:, :] = _DSL_LOGIT_FLOOR
+                for ans_str, val in count_map.items():
                     aidx = answer_to_idx[ans_str]
                     # Gaussian kernel: exp(-0.5 * (soft_count - target)^2)
                     dist = torch.exp(-0.5 * torch.square(soft_count - val))
-                    logits[:, aidx] = dist
+                    logits[:, aidx] = torch.log(dist.clamp_min(1e-12))
+            else:
+                logits[:, :] = 0.0
 
         elif program.op == "Exist":
             # Identity: strongest patch matching the target concept scattered to
-            # the target answer slot (falls back to max over all patches).
+            # the target answer slot. An unseen target has no slot; return zeros
+            # so the fusion engine treats the row as neural-only.
             target = program.args.get("target", "")
             conf = patch_weights.max(dim=1).values.squeeze(-1)  # (B,)
             t_aidx: Optional[int] = answer_to_idx.get(target) if target else None
-            if t_aidx is None:
-                # Unseen target has no slot to write to; spread a uniform,
-                # deliberately low signal across the vocab instead.
-                logits[:, :] = conf.unsqueeze(1) / max(vocab_size, 1)
-            else:
-                logits[:, t_aidx] = conf
+            if t_aidx is not None:
+                logits[:, :] = _DSL_LOGIT_FLOOR
+                logits[:, t_aidx] = torch.log(conf.clamp_min(1e-12))
 
         elif program.op == "Relate":
             # Location: attention-weighted presence of the target concept,
             # modulated by a relation-conditioned spatial prior over patches.
-            target = program.args.get("target", "")
+            target_program = program.args.get("target", "")
             relation = program.args.get("relation", "located_in")
             relation_weights = _relation_patch_weights(relation, patch_weights.size(1), patch_weights.device)
             conf = (patch_weights.squeeze(-1) * relation_weights.unsqueeze(0)).sum(dim=1)  # (B,)
-            r_aidx: Optional[int] = answer_to_idx.get(target) if target else None
+            r_aidx: Optional[int] = answer_to_idx.get(target_program) if target_program else None
             if r_aidx is not None:
-                logits[:, r_aidx] = conf
-            else:
-                logits[:, :] = conf.unsqueeze(1) / max(vocab_size, 1)
+                logits[:, :] = _DSL_LOGIT_FLOOR
+                logits[:, r_aidx] = torch.log(conf.clamp_min(1e-12))
 
         elif program.op == "Verify":
-            # Verification: max patch weight → yes/no confidence
+            # Verification: max patch weight → yes/no confidence. Emit log
+            # evidence and suppress all other classes.
             conf = patch_weights.max(dim=1).values.squeeze(-1)  # (B,)
             yes_idx = answer_to_idx.get("yes")
             no_idx = answer_to_idx.get("no")
             if yes_idx is not None and no_idx is not None:
-                logits[:, yes_idx] = conf * 2.0
-                logits[:, no_idx] = (1.0 - conf) * 2.0
+                logits[:, :] = _DSL_LOGIT_FLOOR
+                logits[:, yes_idx] = torch.log(conf.clamp_min(1e-12))
+                logits[:, no_idx] = torch.log((1.0 - conf).clamp_min(1e-12))
 
         elif program.op == "QueryAttr":
             attr = program.args.get("attribute", "color")
             attr_logits = scene_logits.get(f"scene_{attr}_logits")
             if attr_logits is not None and attr in self.attribute_mappings:
+                if attr_logits.size(0) != batch_size:
+                    # Rows must be executed together with their own scene heads;
+                    # broadcasting a full batch into a single-row program would
+                    # silently score one question with another row's attributes.
+                    raise ValueError(
+                        f"QueryAttr scene logits have batch {attr_logits.size(0)} but patch features "
+                        f"have batch {batch_size}; slice the scene heads to the executed rows"
+                    )
                 mapping = self.attribute_mappings[attr].to(device)
                 valid_mask = mapping >= 0
                 if valid_mask.any():
                     target_indices = mapping[valid_mask]
+                    logits[:, :] = _DSL_LOGIT_FLOOR
                     logits[:, target_indices] = attr_logits[:, valid_mask]
 
         return logits

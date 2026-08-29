@@ -21,7 +21,11 @@ class DistilBERTQuestionEncoder(nn.Module):
     ):
         """Load the frozen DistilBERT tower and inject LoRA adapters."""
         super().__init__()
-        self.backbone = AutoModel.from_pretrained(model_name)
+        try:
+            self.backbone = AutoModel.from_pretrained(model_name, local_files_only=True)
+        except OSError:
+            # Preserve first-run behavior when the model is not cached yet.
+            self.backbone = AutoModel.from_pretrained(model_name)
         for p in self.backbone.parameters():
             p.requires_grad_(False)
         self.backbone = inject_adapter_in_model(
@@ -68,7 +72,11 @@ class DistilBERTQuestionEncoder(nn.Module):
 
 def get_question_tokenizer(model_name: str = "distilbert-base-uncased") -> Any:
     """Return the HF tokenizer for the question encoder."""
-    return AutoTokenizer.from_pretrained(model_name)
+    try:
+        return AutoTokenizer.from_pretrained(model_name, local_files_only=True)
+    except OSError:
+        # Preserve first-run behavior when tokenizer assets are not cached.
+        return AutoTokenizer.from_pretrained(model_name)
 
 
 if __name__ == "__main__":

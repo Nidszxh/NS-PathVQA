@@ -1,6 +1,7 @@
 """Seeds torch, numpy, random, and CUDA for deterministic runs."""
 
 import random
+import os
 
 import numpy as np
 import torch
@@ -14,6 +15,11 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
     for ops with no deterministic CUDA implementation) and disables
     ``cudnn.benchmark`` (the two are incompatible).
     """
+    # cuBLAS reads this when its CUDA context is first initialized, so set it
+    # before torch.manual_seed() or any other call that can touch CUDA.
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -23,10 +29,6 @@ def set_seed(seed: int, deterministic: bool = False) -> None:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         torch.use_deterministic_algorithms(True, warn_only=True)
-        # Required by cuBLAS when deterministic algorithms are requested.
-        import os
-
-        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     else:
         # Reset both flags so callers get a known state regardless of what a
         # previous deterministic run left behind.

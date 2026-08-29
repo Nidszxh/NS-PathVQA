@@ -66,6 +66,7 @@ class ModelOutput:
     attended_features: Optional[torch.Tensor] = None
     qtype_logits: Optional[torch.Tensor] = None
     target_logits: Optional[torch.Tensor] = None
+    target_null_probability: Optional[torch.Tensor] = None
 
     def scene_head_dict(self) -> Dict[str, Optional[torch.Tensor]]:
         """Return the scene-parser heads as the dict consumed by symbolic modules.

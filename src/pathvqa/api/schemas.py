@@ -7,8 +7,17 @@ from pydantic import BaseModel, Field
 class PredictRequest(BaseModel):
     """Request body for /predict and /predict/explain."""
 
-    image_base64: str = Field(..., description="Base64-encoded image (JPEG/PNG)")
-    question: str = Field(..., description="Natural-language question about the image")
+    image_base64: str = Field(
+        ...,
+        max_length=14_000_000,
+        description="Base64-encoded image (JPEG/PNG), limited to approximately 10 MiB decoded",
+    )
+    question: str = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description="Natural-language question about the image",
+    )
 
 
 class SymbolicTrace(BaseModel):

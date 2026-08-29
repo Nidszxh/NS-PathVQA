@@ -26,6 +26,10 @@ from datasets import load_dataset  # noqa: E402  (needs HF_HOME set above)
 # Suppress harmless truncated-TIFF warnings from PathVQA images.
 warnings.filterwarnings("ignore", message="Truncated File Read")
 
+DATASET_REPO_ID = "flaviagiammarino/path-vqa"
+# Resolve to the exact cached Hub commit used for the reproduced metrics.
+DATASET_REVISION = "1685832883334b5bb5beaf4e4b333fdeecaa4ad9"
+
 
 # ImageNet stats — legacy fallback; CLIP norm is preferred (loaded at runtime).
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -39,8 +43,28 @@ def get_clip_normalize() -> Any:
     global _CLIP_PROCESSOR
     if _CLIP_PROCESSOR is None:
         from transformers import CLIPImageProcessor
-        _CLIP_PROCESSOR = CLIPImageProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+        model_name = "openai/clip-vit-base-patch32"
+        try:
+            _CLIP_PROCESSOR = CLIPImageProcessor.from_pretrained(model_name, local_files_only=True)
+        except OSError:
+            # Keep first-run setup working when the processor is not cached yet.
+            _CLIP_PROCESSOR = CLIPImageProcessor.from_pretrained(model_name)
     return transforms.Normalize(mean=_CLIP_PROCESSOR.image_mean, std=_CLIP_PROCESSOR.image_std)
+
+
+def get_normalize(norm: str) -> Any:
+    """Return the normalization transform selected by ``Config.data.norm``.
+
+    Single source of truth shared by the dataset and the serving layer: using
+    CLIP statistics for a checkpoint trained with ImageNet normalization (or
+    vice versa) silently degrades every prediction.
+    """
+    if norm == "clip":
+        return get_clip_normalize()
+    if norm == "imagenet":
+        return transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+    raise ValueError(f"Unknown normalization {norm!r}; expected 'clip' or 'imagenet'")
 
 
 # Bump when preprocessing semantics change (resize interpolation, crop policy,
@@ -80,16 +104,17 @@ class ImageCache:
     rebuilds cleanly instead of reusing stale tensors.
     """
 
-    def __init__(self, cache_dir: Union[str, Path], split: str,
-                 image_size: Tuple[int, int], norm: str = "imagenet"):
+    def __init__(self, cache_dir: Union[str, Path], split: str, image_size: Tuple[int, int], norm: str = "imagenet"):
         self.split = split
         self.key = cache_key(image_size, norm)
         self.dir = Path(cache_dir) / self.key / split
         self.dir.mkdir(parents=True, exist_ok=True)
-        self._transform = transforms.Compose([
-            transforms.Lambda(lambda img: resize_keep_aspect(img, image_size)),
-            transforms.PILToTensor(),  # uint8 (3, H, W)
-        ])
+        self._transform = transforms.Compose(
+            [
+                transforms.Lambda(lambda img: resize_keep_aspect(img, image_size)),
+                transforms.PILToTensor(),  # uint8 (3, H, W)
+            ]
+        )
 
     def _path(self, idx: int) -> Path:
         return self.dir / f"{idx:07d}.pt"
@@ -131,25 +156,39 @@ def lookup_answer_idx(answer: str, answer_to_idx: Dict[str, int]) -> int:
 class PathVQADataset(Dataset[Dict[str, Any]]):
     """PathVQA HuggingFace dataset with CLIP preprocessing and optional caching."""
 
-    def __init__(self, split: str = "train", image_size: Tuple[int, int] = (224, 224),
-                 max_samples: Optional[int] = None,
-                 answer_to_idx: Optional[Dict[str, int]] = None,
-                 use_randaugment: bool = True,
-                 use_cache: bool = True,
-                 cache_dir: Optional[Union[str, Path]] = None,
-                 norm: str = "clip",
-                 randaugment_num_ops: int = 2,
-                 randaugment_magnitude: int = 9):
+    def __init__(
+        self,
+        split: str = "train",
+        image_size: Tuple[int, int] = (224, 224),
+        max_samples: Optional[int] = None,
+        answer_to_idx: Optional[Dict[str, int]] = None,
+        use_randaugment: bool = True,
+        use_cache: bool = True,
+        cache_dir: Optional[Union[str, Path]] = None,
+        norm: str = "clip",
+        randaugment_num_ops: int = 2,
+        randaugment_magnitude: int = 9,
+        image_source_indices: Optional[List[int]] = None,
+    ):
         print(f"Loading PathVQA {split} split from HuggingFace...")
         split_map = {"train": "train", "val": "validation", "test": "test"}
         if split not in split_map:
             raise ValueError(f"Unknown split {split!r}; expected one of {sorted(split_map)}")
         hf_split = split_map[split]
-        self.data = load_dataset("flaviagiammarino/path-vqa", split=hf_split)
+        self.data = load_dataset(DATASET_REPO_ID, split=hf_split, revision=DATASET_REVISION)
         # ``is not None`` so max_samples=0 selects an empty slice instead of
         # silently loading the full split.
         if max_samples is not None:
+            if max_samples < 0:
+                raise ValueError(f"max_samples must be non-negative, got {max_samples}")
             self.data = self.data.select(range(min(max_samples, len(self.data))))
+        self.image_source_indices = image_source_indices
+        if image_source_indices is not None and len(image_source_indices) != len(self.data):
+            raise ValueError("image_source_indices must have one entry per selected dataset row")
+        if image_source_indices is not None and any(
+            source < 0 or source >= len(self.data) for source in image_source_indices
+        ):
+            raise ValueError("image_source_indices entries must refer to selected dataset rows")
 
         if answer_to_idx is None:
             self.answers = sorted(set(normalize_text(a) for a in self.data["answer"]))
@@ -164,22 +203,25 @@ class PathVQADataset(Dataset[Dict[str, Any]]):
         # Cache: uint8 tensors after resize+crop, before aug + norm.
         if use_cache:
             default_cache_dir = _REPO_ROOT / "data" / "cache"
-            self.cache = ImageCache(cache_dir or default_cache_dir, split,
-                                    image_size, norm)
+            self.cache = ImageCache(cache_dir or default_cache_dir, split, image_size, norm)
         else:
             self.cache = None
-        self._base_transform = transforms.Compose([
-            transforms.Lambda(lambda img: resize_keep_aspect(img, image_size)),
-            transforms.PILToTensor(),  # uint8 (3, H, W)
-        ])
+        self._base_transform = transforms.Compose(
+            [
+                transforms.Lambda(lambda img: resize_keep_aspect(img, image_size)),
+                transforms.PILToTensor(),  # uint8 (3, H, W)
+            ]
+        )
         self.augment = use_randaugment and split == "train"
-        self.randaugment = transforms.RandAugment(
-            num_ops=randaugment_num_ops, magnitude=randaugment_magnitude,
-        ) if self.augment else None
-        if norm == "clip":
-            self.normalize = get_clip_normalize()
-        else:
-            self.normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        self.randaugment = (
+            transforms.RandAugment(
+                num_ops=randaugment_num_ops,
+                magnitude=randaugment_magnitude,
+            )
+            if self.augment
+            else None
+        )
+        self.normalize = get_normalize(norm)
 
         print(f"Loaded {len(self.data)} samples, answer vocab: {len(self.answers)}")
 
@@ -190,14 +232,13 @@ class PathVQADataset(Dataset[Dict[str, Any]]):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Load and transform one (image, question, answer) sample."""
         item = self.data[idx]
-        image = item["image"]
+        image_row = self.image_source_indices[idx] if self.image_source_indices is not None else idx
+        image = self.data[image_row]["image"]
         if image is None:
-            raise ValueError(
-                f"Row {idx}: image could not be decoded (missing or corrupt file)."
-            )
+            raise ValueError(f"Row {idx}: image could not be decoded (missing or corrupt file).")
         image = image.convert("RGB")
         if self.cache is not None:
-            img_u8 = self.cache.get(idx, image)
+            img_u8 = self.cache.get(image_row, image)
         else:
             img_u8 = self._base_transform(image)
         # RandAugment on uint8 (train only), then float + normalize.
@@ -217,8 +258,9 @@ class PathVQADataset(Dataset[Dict[str, Any]]):
 @dataclass
 class CollateOutput:
     """Batched samples as produced by ``collate_fn``."""
-    images: torch.Tensor                 # (B, 3, H, W) float, normalized
-    targets: torch.Tensor                # (B,) int64 answer indices
+
+    images: torch.Tensor  # (B, 3, H, W) float, normalized
+    targets: torch.Tensor  # (B,) int64 answer indices
     questions: List[str] = field(default_factory=list)
     answers: List[str] = field(default_factory=list)
 
@@ -226,11 +268,13 @@ class CollateOutput:
 @dataclass
 class BatchData:
     """Device-resident batch as produced by ``prepare_batch``."""
-    input_ids: torch.Tensor              # (B, L)
-    attention_mask: torch.Tensor         # (B, L)
-    targets: torch.Tensor                # (B,)
-    images: torch.Tensor                 # (B, 3, H, W)
+
+    input_ids: torch.Tensor  # (B, L)
+    attention_mask: torch.Tensor  # (B, L)
+    targets: torch.Tensor  # (B,)
+    images: torch.Tensor  # (B, 3, H, W)
     questions: List[str] = field(default_factory=list)
+    answers: List[str] = field(default_factory=list)
 
 
 def collate_fn(batch: List[Dict[str, Any]]) -> CollateOutput:
@@ -243,8 +287,12 @@ def collate_fn(batch: List[Dict[str, Any]]) -> CollateOutput:
     )
 
 
-def prepare_batch(batch: Union[CollateOutput, Dict[str, Any]], tokenizer: Callable[..., Any],
-                  device: torch.device, max_seq_len: int = 64) -> BatchData:
+def prepare_batch(
+    batch: Union[CollateOutput, Dict[str, Any]],
+    tokenizer: Callable[..., Any],
+    device: torch.device,
+    max_seq_len: int = 64,
+) -> BatchData:
     """Tokenize questions and move batch tensors to device.
 
     Accepts a :class:`CollateOutput` (or a dict with the same fields).
@@ -253,16 +301,21 @@ def prepare_batch(batch: Union[CollateOutput, Dict[str, Any]], tokenizer: Callab
         images = batch["images"]
         targets = batch.get("targets", batch.get("answer_indices"))
         questions = batch["questions"]
+        answers = batch.get("answers", [])
         if targets is None:
             raise KeyError("Batch is missing 'targets' (or legacy 'answer_indices').")
     else:
         images = batch.images
         targets = batch.targets
         questions = batch.questions
+        answers = batch.answers
     images = images.to(device)
     enc = tokenizer(
-        questions, return_tensors="pt", padding="max_length",
-        truncation=True, max_length=max_seq_len,
+        questions,
+        return_tensors="pt",
+        padding="max_length",
+        truncation=True,
+        max_length=max_seq_len,
     )
     return BatchData(
         input_ids=enc["input_ids"].to(device),
@@ -270,35 +323,59 @@ def prepare_batch(batch: Union[CollateOutput, Dict[str, Any]], tokenizer: Callab
         targets=targets.to(device),
         images=images,
         questions=list(questions),
+        answers=list(answers),
     )
 
 
-def pathvqa_dataloader(split: str = "train", batch_size: int = 32,
-                       shuffle: bool = True, num_workers: int = 4,
-                       image_size: Tuple[int, int] = (224, 224),
-                       max_samples: Optional[int] = None,
-                       answer_to_idx: Optional[Dict[str, int]] = None,
-                       use_randaugment: bool = True, use_cache: bool = True,
-                       cache_dir: Optional[Union[str, Path]] = None, norm: str = "clip",
-                       randaugment_num_ops: int = 2,
-                       randaugment_magnitude: int = 9) -> DataLoader[Any]:
+def pathvqa_dataloader(
+    split: str = "train",
+    batch_size: int = 32,
+    shuffle: bool = True,
+    num_workers: int = 4,
+    image_size: Tuple[int, int] = (224, 224),
+    max_samples: Optional[int] = None,
+    answer_to_idx: Optional[Dict[str, int]] = None,
+    use_randaugment: bool = True,
+    use_cache: bool = True,
+    cache_dir: Optional[Union[str, Path]] = None,
+    norm: str = "clip",
+    randaugment_num_ops: int = 2,
+    randaugment_magnitude: int = 9,
+    image_source_indices: Optional[List[int]] = None,
+) -> DataLoader[Any]:
     """Create a configured PathVQA DataLoader. Pass ``answer_to_idx`` for val/test
     to align targets with the training vocabulary."""
-    dataset = PathVQADataset(split, image_size, max_samples, answer_to_idx,
-                             use_randaugment, use_cache, cache_dir, norm,
-                             randaugment_num_ops, randaugment_magnitude)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle,
-                      num_workers=num_workers, collate_fn=collate_fn,
-                      pin_memory=True, persistent_workers=(num_workers > 0),
-                      prefetch_factor=2 if num_workers > 0 else None)
+    dataset = PathVQADataset(
+        split,
+        image_size,
+        max_samples,
+        answer_to_idx,
+        use_randaugment,
+        use_cache,
+        cache_dir,
+        norm,
+        randaugment_num_ops,
+        randaugment_magnitude,
+        image_source_indices,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+        persistent_workers=(num_workers > 0),
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
 
 
 if __name__ == "__main__":
     import tempfile
+
     print("Testing PathVQADataset...")
     with tempfile.TemporaryDirectory() as tmp:
-        ds = PathVQADataset(split="train", image_size=(224, 224), max_samples=10,
-                            cache_dir=tmp, norm="clip")
+        ds = PathVQADataset(split="train", image_size=(224, 224), max_samples=10, cache_dir=tmp, norm="clip")
         item = ds[0]
         print(f"Image shape: {item['image'].shape}, Question: {item['question'][:50]}..., Answer: {item['answer']}")
         print(f"Answer vocab size: {len(ds.answers)}")

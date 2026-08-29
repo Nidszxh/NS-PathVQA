@@ -4,9 +4,11 @@ Tests schemas, preprocessing, and endpoint routing using synthetic fixtures.
 No live model or HF download required.
 """
 
+import asyncio
 import base64
 import io
 import pytest
+import httpx
 from unittest.mock import MagicMock
 
 from PIL import Image
@@ -23,6 +25,28 @@ def _make_b64_image(width: int = 224, height: int = 224) -> str:
     buf = io.BytesIO()
     img.save(buf, format="JPEG")
     return base64.b64encode(buf.getvalue()).decode()
+
+
+def _api_request(app, method: str, path: str, **kwargs):
+    """Send a request through ASGI without Starlette's blocking TestClient."""
+
+    async def request():
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.request(method, path, **kwargs)
+
+    return asyncio.run(request())
+
+
+@pytest.fixture(autouse=True)
+def _inline_inference_offload(monkeypatch):
+    """Keep API assertions independent of pytest's broken worker-thread path."""
+    import serve as serve_module
+
+    async def inline(method, *args):
+        return method(*args)
+
+    monkeypatch.setattr(serve_module, "_run_inference", inline)
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +132,21 @@ class TestPreprocessing:
         assert img.mode == "RGB"
         assert img.size == (100, 80)
 
+    def test_invalid_base64_is_rejected(self):
+        from pathvqa.api.inference import PathVQAInference
+
+        inference = object.__new__(PathVQAInference)
+        with pytest.raises(ValueError, match="valid base64"):
+            inference._preprocess_image("not-base64!")
+
+    def test_oversized_image_payload_is_rejected(self):
+        from pathvqa.api.inference import MAX_IMAGE_BYTES, PathVQAInference
+
+        inference = object.__new__(PathVQAInference)
+        oversized = base64.b64encode(b"x" * (MAX_IMAGE_BYTES + 1)).decode()
+        with pytest.raises(ValueError, match="10 MiB"):
+            inference._preprocess_image(oversized)
+
     def test_resize_keep_aspect_import(self):
         from pathvqa.data.pathvqa_dataset import resize_keep_aspect
 
@@ -171,26 +210,19 @@ class TestAPIRouting:
         serve_module._inference = None
 
     def test_health(self):
-        from fastapi.testclient import TestClient
-
-        client = TestClient(self.serve.app)
-        resp = client.get("/health")
+        resp = _api_request(self.serve.app, "GET", "/health")
         assert resp.status_code == 200
         assert resp.json()["status"] == "ok"
 
     def test_model_info(self):
-        from fastapi.testclient import TestClient
-
-        client = TestClient(self.serve.app)
-        resp = client.get("/model/info")
+        resp = _api_request(self.serve.app, "GET", "/model/info")
         assert resp.status_code == 200
         assert resp.json()["num_regions"] == 10
 
     def test_predict(self):
-        from fastapi.testclient import TestClient
-
-        client = TestClient(self.serve.app)
-        resp = client.post(
+        resp = _api_request(
+            self.serve.app,
+            "POST",
             "/predict",
             json={
                 "image_base64": _make_b64_image(),
@@ -203,10 +235,9 @@ class TestAPIRouting:
         assert data["confidence"] == 0.95
 
     def test_predict_explain(self):
-        from fastapi.testclient import TestClient
-
-        client = TestClient(self.serve.app)
-        resp = client.post(
+        resp = _api_request(
+            self.serve.app,
+            "POST",
             "/predict/explain",
             json={
                 "image_base64": _make_b64_image(),
@@ -220,10 +251,7 @@ class TestAPIRouting:
 
     def test_health_no_model(self):
         self.serve._inference = None
-        from fastapi.testclient import TestClient
-
-        client = TestClient(self.serve.app)
-        resp = client.get("/health")
+        resp = _api_request(self.serve.app, "GET", "/health")
         assert resp.status_code == 503
 
 
@@ -312,7 +340,6 @@ class TestRealInference:
     def test_lifespan_loads_checkpoint_and_serves(self, monkeypatch, real_inference):
         """CHECKPOINT_PATH set → lifespan loads a real model → real endpoints."""
         import serve as serve_module
-        from fastapi.testclient import TestClient
 
         monkeypatch.setenv("CHECKPOINT_PATH", real_inference.checkpoint_path)
         # Reuse the already-built real inference object rather than paying for a
@@ -320,45 +347,53 @@ class TestRealInference:
         # still fully exercised.
         monkeypatch.setattr(serve_module, "PathVQAInference", lambda path: real_inference)
         serve_module._inference = None
+
+        async def exercise_lifespan():
+            async with serve_module.app.router.lifespan_context(serve_module.app):
+                transport = httpx.ASGITransport(app=serve_module.app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                    health = await client.get("/health")
+                    assert health.status_code == 200
+                    assert health.json()["status"] == "ok"
+                    assert health.json()["checkpoint"] == real_inference.checkpoint_path
+
+                    info = await client.get("/model/info")
+                    assert info.status_code == 200
+                    assert info.json()["num_answers"] == len(real_inference.answer_vocab)
+
+                    payload = {"image_base64": _make_b64_image(), "question": "What organ is shown?"}
+                    predict = await client.post("/predict", json=payload)
+                    assert predict.status_code == 200
+                    assert predict.json()["answer"] in real_inference.idx_to_answer.values()
+
+                    explain = await client.post("/predict/explain", json=payload)
+                    assert explain.status_code == 200
+                    assert "trace" in explain.json()
+
         try:
-            with TestClient(serve_module.app) as client:
-                health = client.get("/health")
-                assert health.status_code == 200
-                assert health.json()["status"] == "ok"
-                assert health.json()["checkpoint"] == real_inference.checkpoint_path
-
-                info = client.get("/model/info")
-                assert info.status_code == 200
-                assert info.json()["num_answers"] == len(real_inference.answer_vocab)
-
-                payload = {"image_base64": _make_b64_image(), "question": "What organ is shown?"}
-                predict = client.post("/predict", json=payload)
-                assert predict.status_code == 200
-                assert predict.json()["answer"] in real_inference.idx_to_answer.values()
-
-                explain = client.post("/predict/explain", json=payload)
-                assert explain.status_code == 200
-                assert "trace" in explain.json()
+            asyncio.run(exercise_lifespan())
         finally:
             serve_module._inference = None
 
     def test_undecodable_image_returns_400(self, real_inference):
         """Client-supplied garbage must be a 400, not a 500."""
-        from fastapi.testclient import TestClient
         import serve as serve_module
 
         serve_module._inference = real_inference
         try:
-            client = TestClient(serve_module.app)
             bad_image = base64.b64encode(b"this is not an image").decode()
-            resp = client.post("/predict", json={"image_base64": bad_image, "question": "What organ?"})
+            resp = _api_request(
+                serve_module.app,
+                "POST",
+                "/predict",
+                json={"image_base64": bad_image, "question": "What organ?"},
+            )
             assert resp.status_code == 400
         finally:
             serve_module._inference = None
 
     def test_internal_error_returns_500(self, real_inference, monkeypatch):
         """An unexpected backend failure must surface as 500, not a stack trace."""
-        from fastapi.testclient import TestClient
         import serve as serve_module
 
         def _boom(*args, **kwargs):
@@ -367,8 +402,9 @@ class TestRealInference:
         monkeypatch.setattr(real_inference, "predict", _boom)
         serve_module._inference = real_inference
         try:
-            client = TestClient(serve_module.app)
-            resp = client.post(
+            resp = _api_request(
+                serve_module.app,
+                "POST",
                 "/predict",
                 json={"image_base64": _make_b64_image(), "question": "What organ?"},
             )

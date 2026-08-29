@@ -9,11 +9,20 @@ def expected_calibration_error(
     logits: torch.Tensor, labels: torch.Tensor, n_bins: int = 10
 ) -> Tuple[float, List[Dict[str, float]]]:
     """Compute Expected Calibration Error (ECE) across n_bins confidence bins."""
+    if logits.ndim != 2 or logits.size(1) == 0:
+        raise ValueError("logits must have shape (examples, classes) with at least one class")
+    if labels.ndim != 1 or labels.size(0) != logits.size(0) or labels.numel() == 0:
+        raise ValueError("labels must be a non-empty vector matching logits")
+    if n_bins < 1:
+        raise ValueError("n_bins must be positive")
+    labels = labels.to(device=logits.device, dtype=torch.long)
+    if labels.min().item() < 0 or labels.max().item() >= logits.size(1):
+        raise ValueError("labels contain a class index outside the logits vocabulary")
     probs = torch.softmax(logits, dim=1)
     confidences, predictions = probs.max(dim=1)
     accuracies = predictions.eq(labels)
 
-    bin_boundaries = torch.linspace(0, 1, n_bins + 1)
+    bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=confidences.device)
     ece = 0.0  # ECE = Σ_k (|acc_k - conf_k| * n_k) / N
     bin_stats = []
 
@@ -55,20 +64,32 @@ def temperature_scaling(logits: torch.Tensor, labels: torch.Tensor, lr: float = 
     Uses L-BFGS on cross-entropy loss. The temperature parameter is created
     on the same device as ``logits`` so CUDA-resident inputs work directly.
     """
-    T = torch.ones(1, requires_grad=True, device=logits.device)
-    optimizer = torch.optim.LBFGS([T], lr=lr, max_iter=max_iter)
+    if logits.ndim != 2 or logits.size(1) == 0:
+        raise ValueError("logits must have shape (examples, classes) with at least one class")
+    if labels.ndim != 1 or labels.size(0) != logits.size(0) or labels.numel() == 0:
+        raise ValueError("labels must be a non-empty vector matching logits")
+    if lr <= 0 or max_iter < 1:
+        raise ValueError("lr and max_iter must be positive")
+    labels = labels.to(device=logits.device, dtype=torch.long)
+    if labels.min().item() < 0 or labels.max().item() >= logits.size(1):
+        raise ValueError("labels contain a class index outside the logits vocabulary")
+
+    # Optimize log(T), which guarantees a strictly positive temperature.
+    log_temperature = torch.zeros(1, requires_grad=True, device=logits.device)
+    optimizer = torch.optim.LBFGS([log_temperature], lr=lr, max_iter=max_iter)
     criterion = torch.nn.CrossEntropyLoss()
 
     def eval_step() -> torch.Tensor:
         optimizer.zero_grad()
-        scaled_logits = logits / T
+        temperature = log_temperature.exp().clamp(min=1e-6, max=1e6)
+        scaled_logits = logits / temperature
         loss = criterion(scaled_logits, labels)
         assert isinstance(loss, torch.Tensor)
         loss.backward()  # type: ignore[no-untyped-call]
         return loss
 
     optimizer.step(eval_step)  # type: ignore[no-untyped-call]
-    return float(T.item())
+    return float(log_temperature.exp().clamp(min=1e-6, max=1e6).item())
 
 
 def compute_uncertainty(logits: torch.Tensor, method: str = "max_softmax") -> torch.Tensor:

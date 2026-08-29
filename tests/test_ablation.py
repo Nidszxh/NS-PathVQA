@@ -1,4 +1,4 @@
-"""Tests for the canonical A-E ablation matrix (single source of truth)."""
+"""Tests for the canonical full-factorial ablation matrix."""
 
 import pytest
 
@@ -12,13 +12,43 @@ from pathvqa.utils.config import get_default_config
 
 
 def test_matrix_values_match_documented_semantics():
-    """The A-E matrix must encode exactly the documented pipelines."""
+    """Factorial variants and matched learning controls must be present."""
     assert ABLATION_CONFIGS == {
         "A": {"query_parser": "regex", "executor": "hard", "weighting_strategy": "static"},
         "B": {"query_parser": "regex", "executor": "hard", "weighting_strategy": "learned"},
         "C": {"query_parser": "learned", "executor": "differentiable", "weighting_strategy": "learned"},
         "D": {"query_parser": "learned", "executor": "differentiable", "weighting_strategy": "static"},
         "E": {"query_parser": "regex", "executor": "differentiable", "weighting_strategy": "learned"},
+        "F": {"query_parser": "learned", "executor": "hard", "weighting_strategy": "static"},
+        "G": {"query_parser": "regex", "executor": "differentiable", "weighting_strategy": "static"},
+        "H": {"query_parser": "learned", "executor": "hard", "weighting_strategy": "learned"},
+        "I": {
+            "query_parser": "learned",
+            "executor": "differentiable",
+            "weighting_strategy": "static",
+            "enabled": False,
+            "ltn_enabled": False,
+            "aux_region_weight": 0.0,
+            "aux_attr_weight": 0.0,
+            "aux_yn_weight": 0.0,
+            "ontology_sibling_weight": 0.0,
+        },
+        "J": {
+            "query_parser": "learned",
+            "executor": "differentiable",
+            "weighting_strategy": "static",
+            "ltn_enabled": False,
+        },
+        "K": {
+            "query_parser": "learned",
+            "executor": "differentiable",
+            "weighting_strategy": "static",
+            "ltn_enabled": False,
+            "aux_region_weight": 0.0,
+            "aux_attr_weight": 0.0,
+            "aux_yn_weight": 0.0,
+            "ontology_sibling_weight": 0.0,
+        },
     }
 
 

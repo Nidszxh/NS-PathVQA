@@ -114,6 +114,64 @@ def test_execute_yes_no_uses_max_region_confidence(answer_vocab, answer_to_idx):
     assert yn_val != 0 or no_val != 0
 
 
+def test_execute_yes_no_without_a_region_head_emits_no_evidence():
+    """Yes/no rows without a matching concept head stay neural-only.
+
+    Regression: when the yes/no target was an answer-vocabulary entry that is
+    not a discovered region (e.g. "tumor"), the executor used to scatter the
+    region logits into the whole answer vocabulary. A region class could then
+    outrank "yes"/"no", which contaminated 2,159 of the 3,114 validation
+    yes/no rows with the retained checkpoint. Taking the max over organ
+    presence would answer "is any organ present?", so no evidence is written.
+    """
+    answer_vocab = ["yes", "no", "tumor", "lung", "liver"]
+    answer_to_idx = {a: i for i, a in enumerate(answer_vocab)}
+    region_names = ["lung", "liver"]
+    region_mapping = build_region_mapping(region_names, answer_to_idx)
+    attr_mappings = build_attribute_mappings(answer_to_idx)
+    scene_logits = _make_scene_logits(1, len(region_names))
+    neural = torch.zeros(1, len(answer_vocab))
+
+    result = execute(
+        scene_logits,
+        [Query(qtype="yes_no", target="tumor")],
+        region_names,
+        region_mapping,
+        attr_mappings,
+        answer_to_idx,
+        len(answer_vocab),
+        neural,
+    )
+    assert torch.equal(result.symbolic_logits, torch.zeros_like(result.symbolic_logits))
+    assert result.trace["symbolic_used"] == [False]
+
+
+def test_execute_yes_no_with_region_target_writes_only_binary():
+    """A region target must not leak region evidence into its answer slot."""
+    answer_vocab = ["yes", "no", "lung", "liver"]
+    answer_to_idx = {a: i for i, a in enumerate(answer_vocab)}
+    region_names = ["lung", "liver"]
+    region_mapping = build_region_mapping(region_names, answer_to_idx)
+    attr_mappings = build_attribute_mappings(answer_to_idx)
+    scene_logits = _make_scene_logits(1, len(region_names))
+    neural = torch.zeros(1, len(answer_vocab))
+
+    result = execute(
+        scene_logits,
+        [Query(qtype="yes_no", target="lung")],
+        region_names,
+        region_mapping,
+        attr_mappings,
+        answer_to_idx,
+        len(answer_vocab),
+        neural,
+    )
+    row = result.symbolic_logits[0]
+    assert row[answer_to_idx["lung"]] == 0
+    assert row[answer_to_idx["liver"]] == 0
+    assert row[answer_to_idx["yes"]] != 0 or row[answer_to_idx["no"]] != 0
+
+
 def test_execute_count_is_noop(answer_vocab, answer_to_idx):
     regions = build_region_names(answer_vocab)
     region_mapping = build_region_mapping(regions, answer_to_idx)

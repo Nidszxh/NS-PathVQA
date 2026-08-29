@@ -1,6 +1,7 @@
 """Tests for conformal prediction."""
 
 import torch
+import pytest
 from pathvqa.utils.conformal import ConformalPredictor, compute_conformal_metrics
 
 
@@ -111,11 +112,51 @@ def test_conformal_exact_order_statistic():
     assert cp.calibration_stats["quantile_rank"] == k
 
 
-def test_conformal_small_calibration_set_clamps_rank():
-    """alpha so small that k > n must clamp to the max score."""
+def test_conformal_small_calibration_set_uses_all_labels_when_rank_exceeds_n():
+    """When k > n, the exact finite-sample quantile is tau=1 (all labels)."""
     logits = torch.randn(10, 3)
     labels = torch.randint(0, 3, (10,))
     cp = ConformalPredictor(alpha=1e-9)
     tau = cp.calibrate(logits, labels)
-    scores = 1.0 - torch.softmax(logits, dim=1)[torch.arange(10), labels]
-    assert abs(tau - scores.max().item()) < 1e-6
+    assert tau == 1.0
+    assert cp.calibration_stats["quantile_rank"] == 11
+    assert all(len(prediction_set) == logits.size(1) for prediction_set in cp.predict_set(logits))
+
+
+def test_grouped_conformal_uses_worst_question_score_per_image():
+    """The calibration rank is based on independent image groups, not QA rows."""
+    logits = torch.tensor([[3.0, 0.0], [0.2, 0.0], [0.1, 0.0], [0.2, 0.0]])
+    labels = torch.tensor([0, 0, 0, 0])
+    groups = ["image-a", "image-a", "image-b", "image-b"]
+    cp = ConformalPredictor(alpha=0.5)
+
+    tau = cp.calibrate(logits, labels, group_ids=groups)
+
+    scores = 1.0 - torch.softmax(logits, dim=1)[:, 0]
+    expected = torch.stack([scores[:2].max(), scores[2:].max()]).sort().values[1].item()
+    assert tau == pytest.approx(expected)
+    assert cp.calibration_stats["quantile_rank"] == 2
+    assert cp.calibration_stats["n_calibration_groups"] == 2
+    assert cp.calibration_stats["calibration_unit"] == "group maximum"
+    result = cp.evaluate(logits, labels, group_ids=groups)
+    assert result["n_evaluation_groups"] == 2
+    assert result["group_simultaneous_coverage"] == 1.0
+
+
+def test_grouped_conformal_splits_whole_groups():
+    logits = torch.randn(12, 4)
+    labels = torch.randint(0, 4, (12,))
+    groups = [f"image-{i // 3}" for i in range(12)]
+
+    result = compute_conformal_metrics(logits, labels, alphas=[0.2], group_ids=groups)[0.2]
+
+    assert result["calibration_unit"] == "group maximum"
+    assert result["n_calibration_groups"] + result["n_evaluation_groups"] == 4
+    assert "group_simultaneous_coverage" in result
+
+
+def test_conformal_requires_paired_explicit_eval_inputs():
+    logits = torch.randn(4, 3)
+    labels = torch.randint(0, 3, (4,))
+    with pytest.raises(ValueError, match="provided together"):
+        compute_conformal_metrics(logits, labels, eval_logits=torch.randn(2, 3))

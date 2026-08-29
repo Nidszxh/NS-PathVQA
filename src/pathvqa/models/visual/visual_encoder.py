@@ -29,7 +29,13 @@ class CLIPViTEncoder(nn.Module):
 
         # Frozen vision tower: images → (B, 1+num_patches, hidden_size)
         # Typed as Any because peft's inject_adapter_in_model rewraps the module.
-        self.backbone: Any = CLIPVisionModel.from_pretrained(model_name)
+        try:
+            # Prefer an available cache entry so an offline run does not make
+            # needless Hub HEAD requests before loading local weights.
+            self.backbone: Any = CLIPVisionModel.from_pretrained(model_name, local_files_only=True)
+        except OSError:
+            # Preserve first-run behavior: fetch the model when it is not cached.
+            self.backbone = CLIPVisionModel.from_pretrained(model_name)
         for p in self.backbone.parameters():
             p.requires_grad_(False)
 
@@ -133,7 +139,7 @@ class MultiScaleVisualEncoder(CLIPViTEncoder):
 
         # Learned per-token fusion MLP: blends [global ‖ local] features.
         # Note: deliberately *not* sigmoid-bounded — it is a learned affine
-        # blend, not a [0,1] gate (see DOCS.md C6 wording).
+        # blend, not a [0,1] gate (see CHANGELOG.md C6 wording).
         fused = self.scale_fusion(torch.cat([global_out.features, local_summary], dim=-1))
         return VisualEncoderOutput(features=fused, mask=global_out.mask)
 

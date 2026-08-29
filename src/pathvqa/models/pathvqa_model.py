@@ -45,6 +45,7 @@ class NeuroSymbolicPathVQA(nn.Module):
         query_parser: str = "learned",
         use_multiscale: bool = False,
         use_dsl: bool = True,
+        target_no_region_class: bool = False,
     ):
         super().__init__()
         self.symbolic_enabled = symbolic_enabled
@@ -56,6 +57,7 @@ class NeuroSymbolicPathVQA(nn.Module):
         # architecture that saved them, or strict state-dict loading fails on
         # the missing dsl_interpreter.* keys.
         self.use_dsl = bool(use_dsl)
+        self.target_no_region_class = bool(target_no_region_class)
         # Whether the encoder supports/uses the multi-scale branch. ``forward``
         # defaults to this value so configured MultiScaleVisualEncoder models
         # actually exercise the crop branch instead of falling back to
@@ -102,7 +104,9 @@ class NeuroSymbolicPathVQA(nn.Module):
                     hidden_dim=question_hidden_dim, num_classes=5
                 )
                 self.diff_target_extractor = DifferentiableTargetExtractor(
-                    hidden_dim=question_hidden_dim, num_regions=num_regions
+                    hidden_dim=question_hidden_dim,
+                    num_regions=num_regions,
+                    include_no_target=self.target_no_region_class,
                 )
             if weighting_strategy == "learned":
                 self.gate = LearnedGate(
@@ -164,7 +168,18 @@ class NeuroSymbolicPathVQA(nn.Module):
                 result.qtype_logits = qtype_logits
 
                 target_logits = self.diff_target_extractor(q_state, return_probs=False)
-                soft_target = torch.softmax(target_logits, dim=-1)
+                target_probs = torch.softmax(target_logits, dim=-1)
+                if self.target_no_region_class:
+                    soft_target = target_probs[:, : self.scene_parser.num_regions]
+                    null_target_prob = target_probs[:, self.scene_parser.num_regions]
+                    # Exact abstention when the explicit no-region class wins.
+                    # The parser's supervised target loss continues to train
+                    # this discrete decision in hard-executor configurations.
+                    null_wins = null_target_prob >= target_probs[:, : self.scene_parser.num_regions].max(dim=1).values
+                    soft_target = soft_target.masked_fill(null_wins.unsqueeze(1), 0.0)
+                    result.target_null_probability = null_target_prob
+                else:
+                    soft_target = target_probs
                 result.soft_target = soft_target
                 result.target_logits = target_logits
 
@@ -219,6 +234,7 @@ def build_model(
         ),
         use_multiscale=getattr(config.visual, "use_multiscale", False),
         use_dsl=getattr(config.symbolic, "dsl_enabled", True),
+        target_no_region_class=getattr(config.symbolic, "target_no_region_class", False),
     )
     return model
 

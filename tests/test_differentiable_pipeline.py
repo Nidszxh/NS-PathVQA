@@ -99,4 +99,5 @@ def test_diff_pipeline_integration(batch_size):
     assert out.qtype_logits.shape == (batch_size, 5)
 
     assert hasattr(out, "target_logits")
-    assert out.target_logits.shape == (batch_size, 10)
+    assert out.target_logits.shape == (batch_size, 11)  # 10 regions + explicit no-region class
+    assert out.target_null_probability.shape == (batch_size,)

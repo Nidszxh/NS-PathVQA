@@ -13,13 +13,19 @@ class DifferentiableTargetExtractor(nn.Module):
     """Learned, differentiable target-region extractor.
 
     Replaces regex-based target extraction. Predicts which of the ``num_regions``
-    is the primary target of the question (e.g. 'lung', 'glomerulus').
+    is the primary target (e.g. 'lung', 'glomerulus'), optionally with an
+    additional no-target class for questions without a region referent.
     """
 
-    def __init__(self, hidden_dim: int = 768, num_regions: int = 50, dropout: float = 0.1):
+    def __init__(
+        self, hidden_dim: int = 768, num_regions: int = 50, dropout: float = 0.1, include_no_target: bool = False
+    ):
         super().__init__()
+        self.num_regions = num_regions
+        self.include_no_target = include_no_target
+        output_size = num_regions + int(include_no_target)
         self.extractor = nn.Sequential(
-            nn.Linear(hidden_dim, 256), nn.ReLU(), nn.Dropout(dropout), nn.Linear(256, num_regions)
+            nn.Linear(hidden_dim, 256), nn.ReLU(), nn.Dropout(dropout), nn.Linear(256, output_size)
         )
 
     def forward(self, question_state: torch.Tensor, return_probs: bool = True) -> torch.Tensor:
@@ -34,8 +40,8 @@ class DifferentiableTargetExtractor(nn.Module):
             return_probs: If True, return softmax probabilities; else raw logits.
 
         Returns:
-            (B, num_regions) soft target weights when ``return_probs`` is True,
-            otherwise the unnormalized logits.
+            (B, num_regions [+ 1 when include_no_target]) probabilities when
+            ``return_probs`` is True, otherwise the unnormalized logits.
         """
         logits: torch.Tensor = self.extractor(question_state)
         if return_probs:

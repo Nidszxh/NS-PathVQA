@@ -11,6 +11,7 @@ Usage:
 import json
 import math
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -28,6 +29,8 @@ from pathvqa.data.pathvqa_dataset import (
     prepare_batch,
     collate_fn,
     TRANSFORM_VERSION,
+    DATASET_REPO_ID,
+    DATASET_REVISION,
 )
 from pathvqa.models.pathvqa_model import build_model
 from pathvqa.models.ema import ModelEMA
@@ -43,7 +46,7 @@ from pathvqa.symbolic.executor import (
     build_region_mapping,
     build_attribute_mappings,
 )
-from pathvqa.symbolic.aux_losses import compute_symbolic_aux_losses
+from pathvqa.symbolic.aux_losses import compute_symbolic_aux_losses, compute_target_region_loss
 from pathvqa.symbolic.ontology_loss import compute_sibling_regularization
 from pathvqa.symbolic.ltn import MedicalLogicTensorNetwork
 from pathvqa.symbolic.poe import SymbolicFusionEngine
@@ -322,17 +325,12 @@ class Trainer:
             if removed:
                 self.logger.warning(f"Dropping {len(removed)} legacy density-head params from checkpoint")
             self.model.load_state_dict(model_state)
-            if self.ema is not None and self.resume_ckpt.get("ema_state_dict") is not None:
-                ema_state, _ = migrate_legacy_scene_head(self.resume_ckpt["ema_state_dict"])
-                self.resume_ckpt["ema_state_dict"] = ema_state
+            self._restore_ema_state()
             self.optimizer.load_state_dict(self.resume_ckpt["optimizer_state_dict"])
             if "scheduler_state_dict" in self.resume_ckpt:
                 self.scheduler.load_state_dict(self.resume_ckpt["scheduler_state_dict"])
             if "scaler_state_dict" in self.resume_ckpt:
                 self.scaler.load_state_dict(self.resume_ckpt["scaler_state_dict"])
-            if self.ema is not None and self.resume_ckpt.get("ema_state_dict") is not None:
-                self.ema.load_state_dict(self.resume_ckpt["ema_state_dict"])
-                self.logger.info("Restored EMA snapshot from checkpoint")
             self.early_stop_counter = self.resume_ckpt.get("early_stop_counter", 0)
             self.best_val_acc = self.resume_ckpt.get("best_val_acc", 0.0)
             self.best_val_per_type = self.resume_ckpt.get("best_val_per_type", {})
@@ -354,6 +352,27 @@ class Trainer:
                 f"best_val_acc={self.best_val_acc:.2f}%, "
                 f"early_stop_counter={self.early_stop_counter}/{config.training.early_stop_patience}"
             )
+
+    def _restore_ema_state(self) -> None:
+        """Restore the EMA shadow after the model weights are loaded.
+
+        The shadow is normally initialized from the freshly built (random)
+        model. On resume we must either load the checkpoint's snapshot or, when
+        one was never saved (EMA enabled after the fact), re-seed it from the
+        loaded weights. Otherwise validation applies random EMA weights and the
+        bad snapshot is persisted on the next save.
+        """
+        if self.ema is None:
+            return
+        ema_state_dict = self.resume_ckpt.get("ema_state_dict") if self.resume_ckpt is not None else None
+        if ema_state_dict:
+            ema_state, _ = migrate_legacy_scene_head(ema_state_dict)
+            self.resume_ckpt["ema_state_dict"] = ema_state
+            self.ema.load_state_dict(ema_state)
+            self.logger.info("Restored EMA snapshot from checkpoint")
+        else:
+            self.ema.register(self.model)
+            self.logger.warning("Checkpoint has no EMA snapshot; initialized EMA shadow from the loaded model weights")
 
     def _build_optimizer(self):
         t = self.config.training
@@ -424,21 +443,32 @@ class Trainer:
                 outputs = self.model(images, input_ids, attn_mask, qtype_onehot)
                 if warmup_qtype:
                     logits = torch.log_softmax(outputs.answer_logits, dim=-1)
+                    fusion_trace = {}
                 else:
-                    logits, _ = self._compute_symbolic_logits(outputs, questions)
+                    logits, fusion_trace = self._compute_symbolic_logits(outputs, questions)
                 loss = self.criterion(logits, targets) / accum
+                loss_terms = {"answer": loss}
                 if warmup_qtype and outputs.qtype_logits is not None:
                     qtypes = [parse_question(q, self.answer_vocab).qtype for q in questions]
                     qtype_to_idx = {"identity": 0, "location": 1, "yes_no": 2, "attribute": 3, "count": 4}
                     qtype_targets = torch.tensor([qtype_to_idx.get(q, 0) for q in qtypes], device=self.device)
                     qtype_loss = nn.CrossEntropyLoss()(outputs.qtype_logits, qtype_targets)
                     warmup_weight = getattr(self.config.symbolic, "qtype_warmup_weight", 0.1)
-                    loss = loss + warmup_weight * qtype_loss / accum
+                    qtype_term = warmup_weight * qtype_loss / accum
+                    loss = loss + qtype_term
+                    loss_terms["qtype"] = qtype_term
                 if self.ltn_engine is not None and outputs.scene_region_logits is not None:
                     ltn_loss, _ = self.ltn_engine.evaluate_clauses(outputs.scene_head_dict(), qtype_onehot)
-                    loss = loss + getattr(self.config.symbolic, "ltn_weight", 0.1) * ltn_loss / accum
+                    ltn_term = getattr(self.config.symbolic, "ltn_weight", 0.1) * ltn_loss / accum
+                    loss = loss + ltn_term
+                    loss_terms["ltn"] = ltn_term
                 if self.config.symbolic.enabled and outputs.scene_region_logits is not None:
                     queries = [parse_question(q, self.answer_vocab) for q in questions]
+                    if outputs.target_logits is not None:
+                        target_loss = compute_target_region_loss(outputs.target_logits, queries, self.region_names)
+                        target_term = (self.config.symbolic.target_loss_weight * target_loss) / accum
+                        loss = loss + target_term
+                        loss_terms["target"] = target_term
                     aux = compute_symbolic_aux_losses(
                         scene_logits=outputs.scene_head_dict(),
                         queries=queries,
@@ -448,18 +478,41 @@ class Trainer:
                         attribute_mappings=self.attribute_mappings,
                     )
                     cfg = self.config.symbolic
-                    loss = loss + (cfg.aux_region_weight * aux["region"]) / accum
-                    loss = loss + (cfg.aux_attr_weight * aux["attr"]) / accum
-                    loss = loss + (cfg.aux_yn_weight * aux["yn"]) / accum
+                    for name in ("region", "attr", "yn"):
+                        term = (getattr(cfg, f"aux_{name}_weight") * aux[name]) / accum
+                        loss = loss + term
+                        loss_terms[f"aux_{name}"] = term
                 if self.config.symbolic.enabled and self.config.symbolic.ontology_sibling_weight > 0:
                     sibling_loss = compute_sibling_regularization(
                         self.model.scene_parser.region_classifier.weight,
                         self.region_names,
                         self.ontology,
                     )
-                    loss = loss + (self.config.symbolic.ontology_sibling_weight * sibling_loss) / accum
+                    ontology_term = (self.config.symbolic.ontology_sibling_weight * sibling_loss) / accum
+                    loss = loss + ontology_term
+                    loss_terms["ontology"] = ontology_term
+            loss_value = loss.item()
+            if not math.isfinite(loss_value):
+                component_values = {name: float(term.detach().float().item()) for name, term in loss_terms.items()}
+                target_log_probs = logits.detach().gather(1, targets.unsqueeze(1)).squeeze(1).float()
+                bad_rows = ~torch.isfinite(target_log_probs)
+                answer_logits = outputs.answer_logits.detach().float()
+                finite_answer_logits = answer_logits[torch.isfinite(answer_logits)]
+                answer_range = (
+                    [float(finite_answer_logits.min().item()), float(finite_answer_logits.max().item())]
+                    if finite_answer_logits.numel()
+                    else []
+                )
+                raise FloatingPointError(
+                    f"Non-finite training loss at epoch {self.current_epoch}, batch {batch_idx}: {loss_value}; "
+                    f"components={component_values}; target_log_probs={target_log_probs.tolist()}; "
+                    f"bad_questions={[questions[i] for i in bad_rows.nonzero().flatten().tolist()]}; "
+                    f"answer_logits_dtype={outputs.answer_logits.dtype}; answer_logits_finite="
+                    f"{torch.isfinite(answer_logits).sum().item()}/{answer_logits.numel()}; "
+                    f"answer_logits_finite_range={answer_range}; fusion_trace={fusion_trace}"
+                )
             self.scaler.scale(loss).backward()
-            total_loss += loss.item() * accum
+            total_loss += loss_value * accum
             preds = logits.argmax(dim=1)
             correct += (preds == targets).sum().item()
             total += targets.size(0)
@@ -543,7 +596,9 @@ class Trainer:
                 self.ema.restore(self.model)
         if symbolic_count > 0:
             sym_acc = 100.0 * symbolic_correct / symbolic_count
-            self.logger.info(f"  Symbolic path accuracy: {sym_acc:.2f}% ({symbolic_correct}/{symbolic_count})")
+            self.logger.info(
+                f"  Fused accuracy on rows with symbolic evidence: {sym_acc:.2f}% ({symbolic_correct}/{symbolic_count})"
+            )
         if gate_values_per_qtype:
             mean_gates = {q: sum(v) / len(v) for q, v in gate_values_per_qtype.items()}
             self.logger.info(f"  Gate values per qtype: {mean_gates}")
@@ -680,9 +735,23 @@ class Trainer:
         peak_vram_mb = 0.0
         if torch.cuda.is_available():
             peak_vram_mb = torch.cuda.max_memory_allocated() / 1e6
+        train_dataset = getattr(self.train_loader, "dataset", None)
+        val_dataset = getattr(self.val_loader, "dataset", None)
+        train_data = getattr(train_dataset, "data", None)
+        val_data = getattr(val_dataset, "data", None)
         results = {
             "experiment_name": self.config.experiment_name,
             "seed": self.config.seed,
+            "full_config": json.loads(json.dumps(asdict(self.config), default=str)),
+            "dataset": {
+                "repo_id": DATASET_REPO_ID,
+                "hub_revision": DATASET_REVISION,
+                "train_fingerprint": getattr(train_data, "_fingerprint", None),
+                "val_fingerprint": getattr(val_data, "_fingerprint", None),
+                "train_examples": len(train_dataset) if train_dataset is not None else None,
+                "val_examples": len(val_dataset) if val_dataset is not None else None,
+            },
+            "best_checkpoint": str(self.config.paths.best_model_path),
             "config": {
                 "image_size": list(self.config.data.image_size),
                 "batch_size": self.config.data.batch_size,
@@ -693,7 +762,9 @@ class Trainer:
                 "weighting_strategy": self.config.symbolic.weighting_strategy,
                 "query_parser": self.config.symbolic.query_parser,
                 "executor": self.config.symbolic.executor,
-                "num_regions": len(getattr(self, "region_names", []) or self.config.symbolic.num_regions),
+                # ``region_names`` is empty when symbolic reasoning is disabled;
+                # the old fallback returned an int and crashed on ``len``.
+                "num_regions": len(getattr(self, "region_names", None) or []),
                 "norm": self.config.data.norm,
                 "transform_version": TRANSFORM_VERSION,
                 "use_multiscale": self.config.visual.use_multiscale,
@@ -717,6 +788,7 @@ class Trainer:
                 "gpus_used": gpus_used,
                 "peak_vram_mb": round(peak_vram_mb, 1),
                 "epochs_trained": self.current_epoch + 1,
+                "epoch_times_s": list(self.epoch_times),
                 "epoch_time_s_mean": round(sum(self.epoch_times) / len(self.epoch_times), 2)
                 if self.epoch_times
                 else 0.0,
@@ -754,7 +826,7 @@ def main():
         type=str,
         choices=ABLATION_CHOICES,
         default=None,
-        help="Run specific ablation config (A=Baseline, B=SOTA, C=Diff, D=NoGate, E=Regex+Diff)",
+        help="Run a canonical A–K factorial/control configuration (see pathvqa.utils.ablation)",
     )
     parser.add_argument(
         "--weighting-strategy",
@@ -776,7 +848,7 @@ def main():
     else:
         config = get_default_config()
 
-    # Forward CLI flags as config overrides. The A–E matrix itself lives in
+    # Forward CLI flags as config overrides. The A–K matrix itself lives in
     # pathvqa.utils.ablation (shared with evaluate.py and scripts/run_ablations.py);
     # here we only pass the selected key through.
     overrides: Dict[str, Any] = {

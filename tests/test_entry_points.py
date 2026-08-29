@@ -259,16 +259,117 @@ def test_run_ablations_persists_full_matrix(tmp_path, monkeypatch):
 
     run_ablations.main()
 
-    out = tmp_path / "outputs" / "ablation_results.json"
+    out = tmp_path / "outputs" / "ablation_results_seed42.json"
     assert out.exists()
     data = json.loads(out.read_text())
+    assert data["seeds"] == [42]
+    assert data["deterministic"] is True
     assert data["matrix"] == ABLATION_CONFIGS
     assert data["labels"] == ABLATION_LABELS
     expected_names = {f"{k}_{ABLATION_LABELS[k]}" for k in ABLATION_CONFIGS}
     assert set(data["results"]) == expected_names
     for name, res in data["results"].items():
         assert res["status"] == "OK", name
-        assert res["accuracy"] == 61.0
+        assert res["accuracy_mean"] == 61.0
+        # A single seed yields no variance estimate; it must be None, not 0.0.
+        assert res["accuracy_std"] is None
+        assert set(res["runs"]) == {"42"}
+
+
+def test_run_ablations_prunes_epoch_checkpoints_by_default(tmp_path, monkeypatch):
+    import evaluate
+    import train
+
+    run_ablations = _load_script("run_ablations")
+
+    class FakeTrainer:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def train(self):
+            self.cfg.paths.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            self.cfg.paths.best_model_path.write_bytes(b"checkpoint")
+            for epoch in (0, 5, 10):
+                (self.cfg.paths.checkpoint_dir / f"checkpoint_epoch_{epoch}.pt").write_bytes(b"epoch")
+
+    class FakeEvaluator:
+        def __init__(self, checkpoint_path):
+            self.checkpoint_path = checkpoint_path
+
+        def evaluate(self, split="val", max_samples=None):
+            return {"accuracy": 60.0, "per_type_accuracy": {}}
+
+    monkeypatch.setattr(train, "Trainer", FakeTrainer)
+    monkeypatch.setattr(evaluate, "Evaluator", FakeEvaluator)
+    monkeypatch.chdir(tmp_path)
+    run_dir = tmp_path / "checkpoints" / "A_regex_hard_static" / "seed_42"
+
+    monkeypatch.setattr(sys, "argv", ["run_ablations.py", "--ablations", "A"])
+    run_ablations.main()
+    assert (run_dir / "best_model.pt").exists()
+    # best+last is the default: only the highest-numbered snapshot survives.
+    assert [path.name for path in run_dir.glob("checkpoint_epoch_*.pt")] == ["checkpoint_epoch_10.pt"]
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_ablations.py", "--ablations", "A", "--keep-checkpoints", "all", "--output", "outputs/keep.json"],
+    )
+    run_ablations.main()
+    assert len(list(run_dir.glob("checkpoint_epoch_*.pt"))) == 3
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_ablations.py", "--ablations", "A", "--keep-checkpoints", "best", "--output", "outputs/best.json"],
+    )
+    run_ablations.main()
+    assert list(run_dir.glob("checkpoint_epoch_*.pt")) == []
+
+
+def test_run_ablations_persists_running_and_failed_seed_states(tmp_path, monkeypatch):
+    import evaluate
+    import train
+    from pathvqa.utils.ablation import ABLATION_LABELS
+
+    run_ablations = _load_script("run_ablations")
+    output = tmp_path / "outputs" / "ablation_results_seeds17-42-123.json"
+
+    class FakeTrainer:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def train(self):
+            if self.cfg.seed == 17:
+                data = json.loads(output.read_text())
+                name = f"A_{ABLATION_LABELS['A']}"
+                assert data["results"][name]["runs"]["17"]["status"] == "RUNNING"
+                assert data["results"][name]["runs"]["42"]["status"] == "PENDING"
+            if self.cfg.seed == 42:
+                raise RuntimeError("simulated training error")
+            self.cfg.paths.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            self.cfg.paths.best_model_path.write_bytes(b"checkpoint")
+
+    class FakeEvaluator:
+        def __init__(self, checkpoint_path):
+            self.checkpoint_path = checkpoint_path
+
+        def evaluate(self, split="val", max_samples=None):
+            return {"accuracy": 60.0, "per_type_accuracy": {}}
+
+    monkeypatch.setattr(train, "Trainer", FakeTrainer)
+    monkeypatch.setattr(evaluate, "Evaluator", FakeEvaluator)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["run_ablations.py", "--ablations", "A", "--seeds", "17", "42", "123"])
+
+    run_ablations.main()
+
+    data = json.loads(output.read_text())
+    summary = data["results"][f"A_{ABLATION_LABELS['A']}"]
+    assert summary["status"] == "PARTIAL"
+    assert summary["runs"]["17"]["status"] == "OK"
+    assert summary["runs"]["42"]["status"] == "FAILED"
+    assert summary["runs"]["123"]["status"] == "OK"
 
 
 # ---------------------------------------------------------------------------

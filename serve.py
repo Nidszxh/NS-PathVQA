@@ -11,11 +11,13 @@ Endpoints:
     GET  /model/info       — checkpoint metadata
 """
 
+import asyncio
 import logging
 import os
 import argparse
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException
 from PIL.Image import UnidentifiedImageError
@@ -63,8 +65,13 @@ def get_inference() -> PathVQAInference:
     return _inference
 
 
+async def _run_inference(method: Callable[..., Any], *args: Any) -> Any:
+    """Run blocking model inference outside the event loop."""
+    return await asyncio.to_thread(method, *args)
+
+
 @app.get("/health", response_model=HealthResponse)
-def health():
+async def health():
     inf = get_inference()
     return HealthResponse(
         checkpoint=inf.checkpoint_path,
@@ -73,16 +80,16 @@ def health():
 
 
 @app.get("/model/info", response_model=ModelInfoResponse)
-def model_info():
+async def model_info():
     inf = get_inference()
     return ModelInfoResponse(**inf.model_info())
 
 
 @app.post("/predict", response_model=PredictResponse)
-def predict(req: PredictRequest):
+async def predict(req: PredictRequest):
     inf = get_inference()
     try:
-        result = inf.predict(req.image_base64, req.question)
+        result = await _run_inference(inf.predict, req.image_base64, req.question)
     except (ValueError, KeyError, UnidentifiedImageError) as e:
         # Client-input problems: bad base64, undecodable image, malformed text.
         raise HTTPException(status_code=400, detail=str(e))
@@ -95,10 +102,10 @@ def predict(req: PredictRequest):
 
 
 @app.post("/predict/explain", response_model=ExplainResponse)
-def predict_explain(req: PredictRequest):
+async def predict_explain(req: PredictRequest):
     inf = get_inference()
     try:
-        result = inf.explain(req.image_base64, req.question)
+        result = await _run_inference(inf.explain, req.image_base64, req.question)
     except (ValueError, KeyError, UnidentifiedImageError) as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:

@@ -58,3 +58,16 @@ def test_target_extraction_without_vocab():
 def test_unmatched_question_defaults_to_identity():
     q = parse_question("describe the specimen")
     assert q.qtype == "identity"
+
+
+def test_region_target_beats_longer_non_region_word():
+    # "malignant" is longer, but only "lung" has a presence head. Picking the
+    # longer word would make the yes/no row fall back to neural-only.
+    q = parse_question("is there malignant lung tissue?", ["malignant", "lung", "tissue"])
+    assert q.qtype == "yes_no"
+    assert q.target == "lung"
+
+
+def test_non_region_target_still_prefers_longest_word():
+    q = parse_question("what is the malignant lesion?", ["malignant", "lesion"])
+    assert q.target == "malignant"

@@ -171,13 +171,17 @@ def test_backfill_preserves_explicit_symbolic_fields():
 
 
 def test_backfill_adds_new_training_and_symbolic_fields():
-    """New fields (deterministic, qtype_warmup_weight) backfill to defaults."""
+    """New fields backfill to their declared defaults."""
     cfg = get_default_config()
     delattr(cfg.training, "deterministic")
     delattr(cfg.symbolic, "qtype_warmup_weight")
+    delattr(cfg.symbolic, "target_loss_weight")
+    delattr(cfg.symbolic, "target_no_region_class")
     backfill_config(cfg)
     assert cfg.training.deterministic is False
     assert cfg.symbolic.qtype_warmup_weight == 0.1
+    assert cfg.symbolic.target_loss_weight == 0.1
+    assert cfg.symbolic.target_no_region_class is False
 
 
 def test_lora_target_modules_normalized_from_list():
@@ -193,6 +197,7 @@ def test_lora_target_modules_normalized_from_list():
 def test_symbolic_region_names_normalized():
     cfg = SymbolicConfig(region_names=["lung", "liver"])
     assert isinstance(cfg.region_names, tuple)
+    assert cfg.target_no_region_class is True
 
 
 def test_config_save_load_roundtrip(tmp_path):
