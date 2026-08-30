@@ -1,46 +1,29 @@
-# Neuro-Symbolic PathVQA
+# NS-PathVQA
 
-A hybrid **neuro-symbolic Visual Question Answering (VQA)** system for medical pathology images (PathVQA). A neural path (PLIP + DistilBERT with LoRA, cross-attention fusion) is fused with an interpretable symbolic path (scene parser → query parser → executor) via a learned confidence gate. The system provides interpretable reasoning traces while achieving competitive accuracy on the PathVQA benchmark.
+A research codebase for closed-vocabulary visual question answering on pathology images. The model combines pretrained visual and text encoders with scene concepts, query parsing, symbolic execution, and product-of-experts fusion.
 
-> **Status:** All roadmap phases shipped (Phases 1–10, Production track P1–P5, novelty phases C9/C10). See `DOCS.md` for the full record. Key milestones:
-> - **Phase 1:** Baseline recorded (**53.79%** val acc → `outputs/baseline.json`)
-> - **Phase 2:** Data pipeline optimized (**1.8×** throughput → `outputs/cache_benchmark.json`)
-> - **Phase 3-5:** Model upgraded to CLIP+DistilBERT+LoRA with learned gate → **60.33% val / 59.87% test** (+6.54%, **0.38 GPU-h**, 4.1GB VRAM)
-> - **Phase 6-9:** Evaluation tools, baselines, ontology grounding, interpretability
-> - **Phase 10 + novelty phases:** Paper draft (→ `outputs/paper_draft.md`), fully differentiable symbolic pipeline as default, concept-bottleneck interventions
-> - **Production P3:** CI (`ruff` format+lint → strict `mypy` → `pytest` ≥80% coverage) + packaging (`uv pip install -e .`)
+**Checkpoint distinction:** the pre-canonical retained checkpoint used the **regex query parser, hard executor, and static PoE weighting (g=0.3)**. Its legacy config predates explicit parser/executor fields; loading maps it to regex/hard and disables the absent DSL module. It has no learned gate. Before the canonical run it was backed up to `checkpoints/best_model.pre_canonical.pt`. In this run workspace, `checkpoints/best_model.pt` is now the canonical seed-42 neuro-symbolic checkpoint (best epoch 22 of 33); checkpoints are gitignored and are not present in a fresh clone. The canonical results are 60.28% validation (3,773/6,259) and 60.01% test (4,032/6,719). Neither result establishes clinical reliability or state-of-the-art performance.
 
 ## Quick start
 
 ```bash
-source ~/.zangestu/bin/activate            # venv (gitignored); recreate if missing
+source ~/.zangestu/bin/activate
 uv pip install -r requirements.txt
-uv pip install -e .                        # provides `pathvqa.*` imports (once per env)
-python train.py                            # train neuro-symbolic (default)
-python train.py --no-symbolic              # neural-only baseline
-python train.py --debug                    # fast check: 500 train / 100 val / 5 epochs
-python evaluate.py --checkpoint checkpoints/best_model.pt
+uv pip install -e .
+python train.py --debug
+python evaluate.py --checkpoint checkpoints/best_model.pt --split val --num_workers 0
 ```
 
-Full command reference, setup, and configuration live in `AGENTS.md`.
+Full environment rules and commands: [AGENTS.md](AGENTS.md). Architecture, decisions, and history: [CHANGELOG.md](CHANGELOG.md). Research evidence, implementation audit, and outstanding experiments: [AUDIT.md](AUDIT.md). Master-run procedure and completed canonical record: [RUN.md](RUN.md). Generated outputs are gitignored; paths in the run record refer to the local run workspace.
 
-## System at a glance
+## Research readiness
 
-The repo is an end-to-end ML pipeline. All stages are shipped, including CI/CD (`.github/workflows/ci.yml`):
+The canonical seed-42 run is complete: bounded smoke, diagnostic training, early-stopped canonical training, full validation/test evaluation, four full-split image controls, paired cluster-aware analysis, and a release manifest. Results and paths are recorded in [RUN.md](RUN.md) and [AUDIT.md](AUDIT.md). The A–K coverage matrix (descriptive, single seed), expert adjudication, and authorized PathMMU evaluation remain incomplete. No run is currently active, and no files were staged or committed.
 
+## Pipeline
+
+```text
+PathVQA data → preprocessing → PyTorch model → evaluation/artifacts → FastAPI/Docker
 ```
-Dataset → Preprocessing → PyTorch model → Experiment tracking → Evaluation → FastAPI inference → Docker → CI/CD
-```
 
-Stage implementation details live in `DOCS.md` §1–2.
-
-## Document map (one owner per fact)
-
-Each fact lives in exactly one file; the others reference it. If documents conflict, **`DOCS.md` wins**.
-
-| File | Owns | Do NOT look here for |
-|---|---|---|
-| `README.md` | This entry point only | — |
-| `DOCS.md` | **System reference + novelty register (C1–C10) + history, audit outcomes & publication strategy** | How to run the code |
-| `AGENTS.md` | **How to work** — agent rules, commands, setup, conventions, config defaults | Paper strategy |
-| `NS-PathVQA.md` | Personal portfolio write-up (not project docs) | Anything technical |
+API endpoints and deployment details are documented in [AGENTS.md](AGENTS.md).
